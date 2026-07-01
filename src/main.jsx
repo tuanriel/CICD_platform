@@ -2,8 +2,10 @@ import React, { useState, useEffect, useRef } from 'react';
 import ReactDOM from 'react-dom/client';
 import { BrowserRouter, Routes, Route, Navigate, useNavigate, useParams, useLocation, useSearchParams } from 'react-router-dom';
 import './index.css';
+import { listSourceProviders, deleteSourceProvider, syncSourceProvider } from './api/source-providers.js';
+import { listRepositories, deleteRepository } from './api/repositories.js';
 import { TweakColor, TweakRadio, TweakSection, TweakSlider, TweaksPanel, useTweaks } from './tweaks-panel.jsx';
-import { INITIAL_REPOS, PIPELINES, STAGE_PRESETS } from './data.jsx';
+import { PIPELINES, STAGE_PRESETS } from './data.jsx';
 import { Icon, Tag, Toast } from './primitives.jsx';
 import { NAV_FLAT, Sidebar, Topbar } from './layout.jsx';
 import { Dashboard, GitHubConnect } from './views-dashboard.jsx';
@@ -44,10 +46,51 @@ function applyTheme(t) {
   root.style.setProperty("--r-lg", (t.radius + 4) + "px");
 }
 
-const CONNECTED_ACCOUNT = {
-  connected: true, username: "trang.nguyen", name: "Nguyễn Thuỳ Trang", avatar: "TN",
-  email: "trang.nguyen@fpt.com", tokenName: "ghp_••••••••aQ4e", scopes: ["repo", "admin:repo_hook", "read:org"],
-};
+function getInitials(login) {
+  if (!login) return "?";
+  const p = login.split(/[._\-]/);
+  return (p.length >= 2 ? p[0][0] + p[1][0] : login.slice(0, 2)).toUpperCase();
+}
+
+function providerToAccount(sp) {
+  return {
+    connected: true,
+    id: sp.id,
+    username: sp.account_login,
+    name: sp.account_login,
+    avatar: getInitials(sp.account_login),
+    email: "",
+    tokenName: "—",
+    scopes: sp.token_scopes ? sp.token_scopes.split(",").map((s) => s.trim()).filter(Boolean) : [],
+  };
+}
+
+function fmtRelTime(iso) {
+  if (!iso) return "—";
+  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (diff < 60)      return "vừa xong";
+  if (diff < 3600)    return `${Math.floor(diff / 60)} phút trước`;
+  if (diff < 86400)   return `${Math.floor(diff / 3600)} giờ trước`;
+  if (diff < 604800)  return `${Math.floor(diff / 86400)} ngày trước`;
+  return new Date(iso).toLocaleDateString("vi-VN");
+}
+
+function mapApiRepo(r) {
+  return {
+    id:            r.id,
+    fullName:      r.full_name,
+    name:          r.name,
+    owner:         r.owner,
+    repoUrl:       r.repo_url,
+    defaultBranch: r.default_branch,
+    provider:      r.provider,
+    language:      null,
+    private:       false,
+    pipelineCount: 0,
+    status:        "active",
+    lastSync:      fmtRelTime(r.last_synced_at),
+  };
+}
 
 /* Converts legacy { view, repoId, ... } objects → URL path */
 function routeToPath(r) {
@@ -69,9 +112,9 @@ function routeToPath(r) {
 }
 
 /* Route wrapper components — read URL params, pass as props to views */
-function RepoDetailRoute({ repos, onNav, toast }) {
+function RepoDetailRoute({ repos, onNav, toast, onDeleteRepo, onSync }) {
   const { repoId } = useParams();
-  return <RepoDetail repoId={repoId} repos={repos} onNav={onNav} toast={toast} />;
+  return <RepoDetail repoId={repoId} repos={repos} onNav={onNav} toast={toast} onDeleteRepo={onDeleteRepo} onSync={onSync} />;
 }
 
 function PipelineDetailRoute({ repos, onNav, onTriggerBuild, toast }) {
@@ -131,8 +174,8 @@ function AppInner() {
   const navigate = useNavigate();
   const location = useLocation();
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
-  const [account, setAccount] = useState(CONNECTED_ACCOUNT);
-  const [repos, setRepos] = useState(INITIAL_REPOS);
+  const [account, setAccount] = useState({ connected: false });
+  const [repos, setRepos] = useState([]);
   const [toast, setToastState] = useState(null);
   const [addRepoOpen, setAddRepoOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -141,6 +184,22 @@ function AppInner() {
   const toastTimer = useRef(null);
 
   useEffect(() => { applyTheme(t); }, [t]);
+
+  useEffect(() => {
+    listSourceProviders()
+      .then((data) => {
+        const active = (data ?? []).find((sp) => sp.status === "active");
+        if (active) setAccount(providerToAccount(active));
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!account.id) { setRepos([]); return; }
+    listRepositories(account.id)
+      .then((data) => setRepos((data ?? []).map(mapApiRepo)))
+      .catch(() => {});
+  }, [account.id]);
 
   useEffect(() => {
     const isPipelineDetail = /^\/pipelines\/[^/]+$/.test(location.pathname) && location.pathname !== '/pipelines/new';
@@ -169,13 +228,43 @@ function AppInner() {
     return () => window.removeEventListener("keydown", h);
   }, []);
 
-  function connect() { setAccount(CONNECTED_ACCOUNT); showToast("Đã kết nối GitHub thành công", "success"); }
-  function disconnect() { setAccount({ connected: false }); showToast("Đã ngắt kết nối GitHub", "info"); navigate('/github'); }
+  function connect(providerData) {
+    if (providerData?.id) setAccount(providerToAccount(providerData));
+  }
 
-  function addRepo(ghRepo, opts = {}) {
-    const id = "r" + Date.now();
-    const branch = opts.branch || (ghRepo.branches && ghRepo.branches[0]) || "main";
-    setRepos((rs) => [...rs, { id, fullName: ghRepo.fullName, name: ghRepo.name, private: ghRepo.private, language: ghRepo.language, defaultBranch: branch, mappedBranch: branch, patName: opts.patName, lastSync: "vừa xong", pipelineCount: ghRepo.hasWorkflow ? 2 : 0, status: "active" }]);
+  async function disconnect() {
+    if (account.id) {
+      try { await deleteSourceProvider(account.id); } catch {}
+    }
+    setAccount({ connected: false });
+    showToast("Đã ngắt kết nối GitHub", "info");
+    navigate('/github');
+  }
+
+  async function syncRepos() {
+    if (!account.id) return;
+    try {
+      const data = await syncSourceProvider(account.id);
+      showToast(`Đã đồng bộ ${(data ?? []).length} repository từ GitHub`, "success");
+    } catch (err) {
+      showToast(err.message || "Đồng bộ thất bại", "error");
+    }
+  }
+
+  function addRepo(apiRepo, branch) {
+    const mapped = { ...mapApiRepo(apiRepo), mappedBranch: branch };
+    setRepos((rs) => rs.some((r) => r.id === apiRepo.id) ? rs : [...rs, mapped]);
+  }
+
+  async function deleteRepo(repoId) {
+    try {
+      await deleteRepository(repoId);
+      setRepos((rs) => rs.filter((r) => r.id !== repoId));
+      showToast("Đã xoá mapping repository", "info");
+      navigate('/repos');
+    } catch (err) {
+      showToast(err.message || "Xoá thất bại", "error");
+    }
   }
 
   function createPipeline(cfg) {
@@ -228,8 +317,8 @@ function AppInner() {
         <Routes>
           <Route path="/"                                       element={<Dashboard repos={repos} account={account} {...shared} />} />
           <Route path="/github"                                 element={<GitHubConnect account={account} onConnect={connect} onDisconnect={disconnect} {...shared} />} />
-          <Route path="/repos"                                  element={<ReposList repos={repos} account={account} addRepoOpen={addRepoOpen} setAddRepoOpen={setAddRepoOpen} onAddRepo={addRepo} {...shared} />} />
-          <Route path="/repos/:repoId"                          element={<RepoDetailRoute repos={repos} {...shared} />} />
+          <Route path="/repos"                                  element={<ReposList repos={repos} account={account} addRepoOpen={addRepoOpen} setAddRepoOpen={setAddRepoOpen} onAddRepo={addRepo} onSync={syncRepos} {...shared} />} />
+          <Route path="/repos/:repoId"                          element={<RepoDetailRoute repos={repos} onDeleteRepo={deleteRepo} onSync={syncRepos} {...shared} />} />
           <Route path="/pipelines"                              element={<PipelinesList repos={repos} account={account} onTriggerBuild={triggerBuild} {...shared} />} />
           <Route path="/pipelines/new"                          element={<CreatePipeline repos={repos} account={account} onCreate={createPipeline} {...shared} />} />
           <Route path="/pipelines/:pipelineId"                  element={<PipelineDetailRoute repos={repos} onTriggerBuild={triggerBuild} {...shared} />} />

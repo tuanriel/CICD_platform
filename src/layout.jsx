@@ -12,7 +12,7 @@ const NAV = [
     id: "g-repo", label: "Repository", icon: "repo", group: true, children: [
       { id: "repos",     label: "Danh sách repository", icon: "repo",     to: "/repos" },
       { id: "pipelines", label: "Pipeline",              icon: "pipeline", to: "/pipelines" },
-      { id: "webhooks",  label: "Webhook",               icon: "webhook",  to: "/webhooks" },
+      // { id: "webhooks",  label: "Webhook",               icon: "webhook",  to: "/webhooks" },
     ],
   },
   { id: "build-history", label: "Lịch sử build",   icon: "clock", to: "/build-history" },

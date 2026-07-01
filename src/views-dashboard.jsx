@@ -3,6 +3,15 @@ import { PIPELINES, WEBHOOK_EVENTS } from './data.jsx';
 import { Avatar, Button, Card, Icon, Input, STATUS_META, SectionLabel, StatusBadge, StatusDot, Tag } from './primitives.jsx';
 import { Page, PageHeader } from './layout.jsx';
 import { allPipelineRuns } from './views-build-history.jsx';
+import { createSourceProvider } from './api/source-providers.js';
+
+const API_ERROR_MESSAGES = {
+  INVALID_TOKEN:      "Token không hợp lệ hoặc đã hết hạn",
+  INSUFFICIENT_SCOPE: "Token thiếu quyền repo",
+  MAPPING_EXISTS:     "Tài khoản này đã được liên kết",
+  UPSTREAM_ERROR:     "Không kết nối được GitHub",
+  NETWORK_ERROR:      "Không thể kết nối tới server",
+};
 
 /* ============================================================
    Views — Dashboard + GitHub connect
@@ -191,10 +200,17 @@ function GitHubConnect({ account, onConnect, onDisconnect, onNav, toast }) {
 
   const valid = token.trim().startsWith("ghp_") && token.trim().length >= 20;
 
-  function doConnect() {
+  async function doConnect() {
     if (!valid) return;
     setConnecting(true);
-    setTimeout(() => { setConnecting(false); onConnect(); }, 1700);
+    try {
+      const data = await createSourceProvider({ provider_type: "github", access_token: token.trim() });
+      onConnect(data);
+    } catch (err) {
+      toast?.(API_ERROR_MESSAGES[err.code] || err.message || "Kết nối thất bại", "error");
+    } finally {
+      setConnecting(false);
+    }
   }
 
   return (
@@ -209,8 +225,8 @@ function GitHubConnect({ account, onConnect, onDisconnect, onNav, toast }) {
             <div style={{ display: "flex", alignItems: "center", gap: 14, paddingBottom: 18, borderBottom: "1px solid var(--border)", marginBottom: 18 }}>
               <Avatar initials={account.avatar} size={52} />
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 16.5, fontWeight: 620, letterSpacing: "-.02em" }}>{account.name}</div>
-                <div style={{ fontSize: 13, color: "var(--text-2)" }} >@{account.username} · {account.email}</div>
+                <div style={{ fontSize: 16.5, fontWeight: 620, letterSpacing: "-.02em" }}>{account.name || account.username}</div>
+                <div style={{ fontSize: 13, color: "var(--text-2)" }}>@{account.username}{account.email ? ` · ${account.email}` : ""}</div>
               </div>
               <StatusBadge status="active" />
             </div>

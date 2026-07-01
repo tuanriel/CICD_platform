@@ -1,15 +1,13 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { PIPELINES } from './data.jsx';
-import { GH_WORKFLOWS, parseGitHubActions, presetFromLanguage, workflowToStages } from './data-pipeline.jsx';
-import { Button, Card, Icon, SectionLabel, Tag } from './primitives.jsx';
+import React, { useState } from 'react';
+import { Button, Card, Icon, Tag } from './primitives.jsx';
 import { Page, PageHeader } from './layout.jsx';
 import { EmptyConnectState } from './views-dashboard.jsx';
 import { Select } from './views-build.jsx';
-import { Meta } from './views-build-history.jsx';
+import { syncRepository } from './api/repositories.js';
 
 /* ============================================================
-   Views — Tạo pipeline từ GitHub Actions
-   Quét repo → phát hiện .github/workflows/*.yml → parse → tạo
+   Views — Đồng bộ pipeline từ .workflow/
+   POST /repositories/:id/sync → parse *.yaml → Pipeline[]
    ============================================================ */
 
 function StepHead({ n, title, desc, done, active }) {
@@ -23,133 +21,174 @@ function StepHead({ n, title, desc, done, active }) {
         {done ? <Icon name="check" size={14} strokeWidth={3} /> : n}
       </div>
       <div>
-        <div style={{ fontSize: 15, fontWeight: 600, letterSpacing: "-.02em", color: active || done ? "var(--text)" : "var(--text-3)" }}>{title}</div>
+        <div style={{ fontSize: 15, fontWeight: 600, letterSpacing: "-.02em",
+          color: active || done ? "var(--text)" : "var(--text-3)" }}>{title}</div>
         {desc && <div style={{ fontSize: 12.5, color: "var(--text-3)", marginTop: 2 }}>{desc}</div>}
       </div>
     </div>
   );
 }
 
-function CreatePipeline({ repos, account, onNav, onCreate, toast }) {
-  const [repoId, setRepoId] = useState("");
-  const [scanning, setScanning] = useState(false);
-  const [scanned, setScanned] = useState(false);
-  const [files, setFiles] = useState([]);
-  const [selFile, setSelFile] = useState(null);
-  const [parsed, setParsed] = useState(null);
-  const [parsing, setParsing] = useState(false);
-  const [creating, setCreating] = useState(false);
+function CreatePipeline({ repos, account, onNav, toast }) {
+  const [repoId, setRepoId]       = useState("");
+  const [scanning, setScanning]   = useState(false);
+  const [scanned, setScanned]     = useState(false);
+  const [pipelines, setPipelines] = useState([]);
+  const [scanError, setScanError] = useState(null);
 
   const repo = repos.find((r) => r.id === repoId);
 
   if (!account.connected) {
-    return <Page><PageHeader title="Tạo pipeline" icon="pipeline" /><EmptyConnectState onNav={onNav} /></Page>;
+    return <Page><PageHeader title="Đồng bộ pipeline" icon="pipeline" /><EmptyConnectState onNav={onNav} /></Page>;
   }
 
   function pickRepo(id) {
-    setRepoId(id); setScanned(false); setFiles([]); setSelFile(null); setParsed(null);
+    setRepoId(id);
+    setScanned(false);
+    setPipelines([]);
+    setScanError(null);
   }
 
-  function scan() {
+  async function scan() {
     if (!repo) return;
-    setScanning(true); setScanned(false); setSelFile(null); setParsed(null);
-    setTimeout(() => {
-      const wf = GH_WORKFLOWS[repo.fullName] || [];
-      const enriched = wf.map((f) => {
-        const p = parseGitHubActions(f.yaml);
-        const imported = PIPELINES.some((pl) => pl.repoId === repo.id && pl.name === f.file);
-        return { ...f, parsed: p, steps: workflowToStages(p).length, jobs: p.jobs.length, imported };
-      });
-      setFiles(enriched);
-      setScanning(false); setScanned(true);
-    }, 1100);
+    setScanning(true);
+    setScanned(false);
+    setScanError(null);
+    setPipelines([]);
+    try {
+      const data = await syncRepository(repo.id);
+      setPipelines(data ?? []);
+      setScanned(true);
+      const ok  = (data ?? []).filter((p) => p.status === "active").length;
+      const err = (data ?? []).filter((p) => p.status === "error").length;
+      if (data?.length === 0) {
+        toast("Không tìm thấy file .workflow/*.yaml nào", "info");
+      } else if (err > 0) {
+        toast(`Quét xong · ${ok} pipeline OK · ${err} lỗi parse`, "error");
+      } else {
+        toast(`Phát hiện ${ok} pipeline`, "success");
+      }
+    } catch (e) {
+      const msgs = {
+        RESOURCE_NOT_FOUND: "Repository không tồn tại trong platform.",
+        UPSTREAM_ERROR:     "Không kết nối được GitHub hoặc không lấy được file.",
+      };
+      setScanError(msgs[e.code] || e.message || "Quét thất bại");
+    } finally {
+      setScanning(false);
+    }
   }
 
-  function pickFile(f) {
-    if (f.imported) return;
-    setSelFile(f); setParsed(null); setParsing(true);
-    setTimeout(() => { setParsed(f.parsed); setParsing(false); }, 850);
-  }
-
-  function create() {
-    if (!parsed || !repo || !selFile) return;
-    setCreating(true);
-    const stages = workflowToStages(parsed);
-    setTimeout(() => {
-      onCreate({
-        repoId: repo.id, file: selFile.file, path: ".github/workflows/" + selFile.file,
-        title: parsed.name || selFile.file, name: selFile.file,
-        triggers: parsed.triggers, branchFilter: parsed.branches.join(", ") || "—",
-        stages, preset: presetFromLanguage(repo.language), env: parsed.env, jobs: parsed.jobs.length,
-      });
-      setCreating(false);
-      toast(`Đã tạo pipeline “${parsed.name || selFile.file}”`, "success");
-      onNav({ view: "pipelines" });
-    }, 1100);
-  }
-
-  const stages = parsed ? workflowToStages(parsed) : [];
+  const plOk  = pipelines.filter((p) => p.status === "active").length;
+  const plErr = pipelines.filter((p) => p.status === "error").length;
 
   return (
     <Page>
-      <PageHeader title="Tạo pipeline" icon="pipeline"
-        breadcrumb={[{ label: "Pipeline", to: { view: "pipelines" } }, { label: "Tạo pipeline" }]} onNav={onNav}
-        subtitle="Nền tảng quét repository, phát hiện file GitHub Actions trong .github/workflows và phân tích (parse) thành pipeline được quản lý tập trung." />
+      <PageHeader title="Đồng bộ pipeline" icon="pipeline"
+        breadcrumb={[{ label: "Pipeline", to: { view: "pipelines" } }, { label: "Đồng bộ pipeline" }]} onNav={onNav}
+        subtitle="Quét thư mục .workflow/ trong repository, parse file YAML và đồng bộ pipeline vào platform." />
 
       {/* Step 1 — chọn repo */}
       <Card style={{ marginBottom: 16 }}>
-        <StepHead n="1" title="Chọn repository" desc="Repo đã liên kết qua PAT GitHub." done={!!repo} active />
+        <StepHead n="1" title="Chọn repository" desc="Repository đã ánh xạ vào platform." done={!!repo} active />
         <div style={{ display: "flex", gap: 10, alignItems: "center", paddingLeft: 38 }}>
           <div style={{ flex: 1, maxWidth: 420 }}>
-            <Select value={repoId} onChange={pickRepo} full options={[{ value: "", label: "— Chọn repository —" },
-              ...repos.map((r) => ({ value: r.id, label: r.fullName }))]} />
+            <Select value={repoId} onChange={pickRepo} full
+              options={[
+                { value: "", label: "— Chọn repository —" },
+                ...repos.map((r) => ({ value: r.id, label: r.fullName })),
+              ]} />
           </div>
-          <Button variant="primary" icon={scanning ? null : "search"} loading={scanning} disabled={!repo} onClick={scan}>
+          <Button variant="primary" icon={scanning ? null : "search"} loading={scanning}
+            disabled={!repo} onClick={scan}>
             {scanning ? "Đang quét…" : "Quét repository"}
           </Button>
         </div>
+
+        {scanError && (
+          <div style={{ marginTop: 12, marginLeft: 38, display: "flex", alignItems: "center", gap: 8,
+            padding: "10px 13px", background: "var(--red-dim)",
+            border: "1px solid color-mix(in oklab, var(--red) 40%, transparent)",
+            borderRadius: "var(--r-sm)", fontSize: 13, color: "var(--red)" }}>
+            <Icon name="xCircle" size={14} />{scanError}
+          </div>
+        )}
+
+        {repo && (
+          <div style={{ marginTop: 12, marginLeft: 38, display: "flex", alignItems: "center", gap: 8,
+            padding: "9px 12px", background: "var(--panel-2)", border: "1px solid var(--border)",
+            borderRadius: "var(--r-sm)", fontSize: 12.5, color: "var(--text-3)" }}>
+            <Icon name="info" size={13} />
+            Platform sẽ gọi <span className="mono" style={{ margin: "0 4px", color: "var(--text-2)" }}>
+              POST /repositories/{repo.id.slice(0, 8)}…/sync
+            </span> để quét và parse file trong <span className="mono" style={{ margin: "0 4px" }}>.workflow/</span>.
+          </div>
+        )}
       </Card>
 
       {/* Step 2 — kết quả quét */}
       {(scanning || scanned) && (
         <Card style={{ marginBottom: 16 }}>
-          <StepHead n="2" title="File workflow phát hiện được" desc={repo ? `Quét .github/workflows trong ${repo.fullName}` : ""} done={!!selFile} active={!selFile} />
+          <StepHead n="2" title="Pipeline phát hiện được"
+            desc={repo ? `Quét .workflow/*.yaml trong ${repo.fullName}` : ""}
+            done={scanned && pipelines.length > 0}
+            active={scanning || (scanned && pipelines.length === 0)} />
           <div style={{ paddingLeft: 38 }}>
             {scanning ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {[0, 1].map((i) => <div key={i} style={{ height: 58, borderRadius: "var(--r-md)", background: "var(--panel-2)", border: "1px solid var(--border)", animation: "pulse-dot 1.2s ease-in-out infinite", animationDelay: i * 0.15 + "s" }} />)}
+                {[0, 1].map((i) => (
+                  <div key={i} style={{ height: 58, borderRadius: "var(--r-md)",
+                    background: "var(--panel-2)", border: "1px solid var(--border)",
+                    animation: "pulse-dot 1.2s ease-in-out infinite",
+                    animationDelay: i * 0.15 + "s" }} />
+                ))}
               </div>
-            ) : files.length === 0 ? (
-              <div style={{ padding: "20px 0", display: "flex", alignItems: "center", gap: 10, color: "var(--text-3)", fontSize: 13.5 }}>
-                <Icon name="info" size={16} />Không tìm thấy file nào trong .github/workflows. Repository này chưa có GitHub Actions.
+            ) : pipelines.length === 0 ? (
+              <div style={{ padding: "20px 0", display: "flex", alignItems: "center", gap: 10,
+                color: "var(--text-3)", fontSize: 13.5 }}>
+                <Icon name="info" size={16} />
+                Không tìm thấy file nào trong{" "}
+                <span className="mono" style={{ margin: "0 4px" }}>.workflow/</span>.
+                Thêm file <span className="mono" style={{ margin: "0 4px" }}>*.yaml</span>
+                vào thư mục đó để platform nhận diện pipeline.
               </div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-                {files.map((f) => {
-                  const sel = selFile?.file === f.file;
+                {pipelines.map((p) => {
+                  const isErr = p.status === "error";
                   return (
-                    <button key={f.file} onClick={() => pickFile(f)} disabled={f.imported}
-                      style={{ display: "flex", alignItems: "center", gap: 13, padding: "12px 14px", textAlign: "left",
-                        border: `1px solid ${sel ? "var(--accent-border)" : "var(--border)"}`, borderRadius: "var(--r-md)",
-                        background: sel ? "var(--accent-dim)" : "var(--panel-2)", opacity: f.imported ? 0.55 : 1,
-                        cursor: f.imported ? "not-allowed" : "pointer", transition: "all .12s" }}>
-                      <div style={{ width: 34, height: 34, borderRadius: 8, background: "var(--panel-3)", display: "grid", placeItems: "center", flexShrink: 0 }}>
-                        <Icon name="code" size={17} style={{ color: f.imported ? "var(--text-3)" : "var(--accent)" }} />
+                    <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 13,
+                      padding: "12px 14px",
+                      border: `1px solid ${isErr ? "color-mix(in oklab, var(--red) 30%, transparent)" : "var(--border)"}`,
+                      borderRadius: "var(--r-md)",
+                      background: isErr ? "var(--red-dim)" : "var(--panel-2)" }}>
+                      <div style={{ width: 34, height: 34, borderRadius: 8, flexShrink: 0,
+                        background: isErr ? "color-mix(in oklab, var(--red) 15%, transparent)" : "var(--panel-3)",
+                        display: "grid", placeItems: "center" }}>
+                        <Icon name={isErr ? "xCircle" : "pipeline"} size={17}
+                          style={{ color: isErr ? "var(--red)" : "var(--accent)" }} />
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-                          <span className="mono" style={{ fontSize: 13, fontWeight: 560 }}>.github/workflows/{f.file}</span>
-                          {f.imported && <Tag>đã đồng bộ</Tag>}
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                          <span style={{ fontSize: 13.5, fontWeight: 560 }}>{p.name}</span>
+                          <span className="mono" style={{ fontSize: 11.5, color: "var(--text-3)" }}>
+                            {p.file_path}
+                          </span>
                         </div>
-                        <div style={{ fontSize: 12, color: "var(--text-3)", marginTop: 3, display: "flex", gap: 12, flexWrap: "wrap" }}>
-                          <span>{f.parsed.name}</span>
-                          <span>·</span>
-                          <span>{f.jobs} job · {f.steps} step</span>
-                          <span style={{ display: "inline-flex", gap: 5 }}>{f.parsed.triggers.slice(0, 3).map((t) => <span key={t} className="mono" style={{ color: "var(--text-2)" }}>{t}</span>)}</span>
+                        <div style={{ fontSize: 12, marginTop: 3,
+                          color: isErr ? "var(--red)" : "var(--text-3)" }}>
+                          {isErr
+                            ? "Lỗi cú pháp YAML — pipeline ở trạng thái error, không thể trigger"
+                            : "Parse thành công · sẵn sàng trigger thủ công"}
                         </div>
                       </div>
-                      {!f.imported && <Icon name={sel ? "checkCircle" : "chevronRight"} size={17} style={{ color: sel ? "var(--accent)" : "var(--text-3)" }} />}
-                    </button>
+                      <div style={{ flexShrink: 0 }}>
+                        {isErr
+                          ? <Tag mono color="var(--red)"
+                              bg="color-mix(in oklab,var(--red) 18%,transparent)">error</Tag>
+                          : <Tag mono color="var(--green)" bg="var(--green-dim)" icon="check">active</Tag>}
+                      </div>
+                    </div>
                   );
                 })}
               </div>
@@ -158,67 +197,46 @@ function CreatePipeline({ repos, account, onNav, onCreate, toast }) {
         </Card>
       )}
 
-      {/* Step 3 — parse preview */}
-      {selFile && (
+      {/* Step 3 — kết quả & điều hướng */}
+      {scanned && pipelines.length > 0 && (
         <Card style={{ marginBottom: 16 }}>
-          <StepHead n="3" title="Phân tích & ánh xạ" desc={`Parse ${selFile.file} → stage của pipeline`} done={!!parsed && !creating} active />
+          <StepHead n="3" title="Hoàn tất"
+            desc="Pipeline đã được tạo và lưu vào platform."
+            done active={false} />
           <div style={{ paddingLeft: 38 }}>
-            {parsing ? (
-              <div style={{ display: "flex", alignItems: "center", gap: 11, padding: "24px 0", color: "var(--accent)", fontSize: 13.5 }}>
-                <Icon name="refresh" size={17} style={{ animation: "spin .8s linear infinite" }} />Đang phân tích cú pháp YAML…
-              </div>
-            ) : parsed ? (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, alignItems: "start" }}>
-                {/* raw yaml */}
-                <div>
-                  <SectionLabel style={{ marginBottom: 8 }}>Nguồn · GitHub Actions</SectionLabel>
-                  <div style={{ background: "var(--code-bg)", border: "1px solid var(--border)", borderRadius: "var(--r-md)", padding: 14, maxHeight: 340, overflow: "auto" }}>
-                    <pre className="mono" style={{ margin: 0, fontSize: 11.5, lineHeight: 1.6, color: "var(--text-2)", whiteSpace: "pre" }}>{selFile.yaml}</pre>
-                  </div>
+            <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 18 }}>
+              {plOk > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13.5 }}>
+                  <Icon name="checkCircle" size={16} style={{ color: "var(--green)" }} strokeWidth={2} />
+                  {plOk} pipeline sẵn sàng
                 </div>
-                {/* parsed result */}
-                <div>
-                  <SectionLabel style={{ marginBottom: 8 }}>Kết quả parse</SectionLabel>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                      <Meta label="Tên pipeline" value={parsed.name || "—"} />
-                      <Meta label="Số job" value={parsed.jobs.length} />
-                      <Meta label="Trigger" value={<div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>{parsed.triggers.map((t) => <Tag key={t} mono>{t}</Tag>)}</div>} />
-                      <Meta label="Nhánh" value={<span className="mono" style={{ fontSize: 12 }}>{parsed.branches.join(", ") || "—"}</span>} />
-                    </div>
-                    {Object.keys(parsed.env).length > 0 && (
-                      <div>
-                        <div style={{ fontSize: 11.5, color: "var(--text-3)", marginBottom: 6, fontWeight: 500 }}>Biến môi trường</div>
-                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                          {Object.entries(parsed.env).map(([k, v]) => <Tag key={k} mono>{k}={v}</Tag>)}
-                        </div>
-                      </div>
-                    )}
-                    <div>
-                      <div style={{ fontSize: 11.5, color: "var(--text-3)", marginBottom: 8, fontWeight: 500 }}>Stage được ánh xạ ({stages.length})</div>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
-                        {stages.map((s, i) => (
-                          <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, padding: "5px 10px", borderRadius: 99, background: "var(--panel-2)", border: "1px solid var(--border)" }}>
-                            <span className="mono" style={{ color: "var(--text-3)", fontSize: 11 }}>{i + 1}</span>{s}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
+              )}
+              {plErr > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13.5, color: "var(--red)" }}>
+                  <Icon name="xCircle" size={16} strokeWidth={2} />
+                  {plErr} file YAML lỗi — kiểm tra cú pháp rồi đồng bộ lại
                 </div>
-              </div>
-            ) : null}
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 9, flexWrap: "wrap" }}>
+              <Button variant="secondary" icon="repo"
+                onClick={() => onNav({ view: "repo", repoId: repo.id })}>
+                Xem trong Repository
+              </Button>
+              <Button variant="primary" icon="pipeline"
+                onClick={() => onNav({ view: "pipelines" })}>
+                Đến danh sách Pipeline
+              </Button>
+            </div>
           </div>
         </Card>
       )}
 
-      {/* actions */}
-      <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
-        <Button variant="ghost" onClick={() => onNav({ view: "pipelines" })}>Huỷ</Button>
-        <Button variant="primary" icon={creating ? null : "plus"} loading={creating} disabled={!parsed || parsing} onClick={create}>
-          {creating ? "Đang tạo pipeline…" : "Tạo pipeline"}
-        </Button>
-      </div>
+      {!scanned && (
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <Button variant="ghost" onClick={() => onNav({ view: "pipelines" })}>Huỷ</Button>
+        </div>
+      )}
     </Page>
   );
 }
