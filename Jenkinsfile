@@ -1,12 +1,13 @@
 pipeline {
-    agent any
+    agent {
+        docker {
+            image 'node:20'
+            args '-u root:root'
+        }
+    }
 
     options {
         buildDiscarder(logRotator(artifactDaysToKeepStr: '7'))
-    }
-
-    tools {
-        nodejs 'node20'
     }
 
     stages {
