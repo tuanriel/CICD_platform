@@ -1,8 +1,24 @@
 pipeline {
     agent {
-        docker {
-            image 'node:20'
-            args '-u root:root'
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: node
+      image: node:20
+      command: ["cat"]
+      tty: true
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "1"
+          memory: "1Gi"
+'''
+            defaultContainer 'node'
         }
     }
 
