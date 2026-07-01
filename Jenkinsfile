@@ -27,17 +27,6 @@ spec:
     }
 
     stages {
-        stage('Check branch') {
-            steps {
-                script {
-                    if (!(env.BRANCH_NAME in ['main', 'master'])) {
-                        currentBuild.result = 'NOT_BUILT'
-                        error("Skip build: branch '${env.BRANCH_NAME}' không nằm trong ['main', 'master']")
-                    }
-                }
-            }
-        }
-
         stage('Checkout code') {
             steps {
                 checkout scm
