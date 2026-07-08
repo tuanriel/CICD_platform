@@ -81,7 +81,10 @@ const STATUS_META = {
   failed:   { color: "var(--red)",   dim: "var(--red-dim)",   label: "Thất bại",   icon: "xCircle" },
   running:  { color: "var(--amber)", dim: "var(--amber-dim)", label: "Đang chạy",  icon: "dot" },
   queued:   { color: "var(--text-3)",dim: "var(--panel-3)",   label: "Hàng đợi",   icon: "clock" },
+  pending:  { color: "var(--text-3)",dim: "var(--panel-3)",   label: "Đã đồng bộ", icon: "doc" },
   skipped:  { color: "var(--text-3)",dim: "var(--panel-3)",   label: "Bỏ qua",     icon: "dot" },
+  aborted:  { color: "var(--text-3)",dim: "var(--panel-3)",   label: "Đã huỷ",     icon: "stop" },
+  unstable: { color: "var(--amber)", dim: "var(--amber-dim)", label: "Không ổn định", icon: "info" },
   active:   { color: "var(--green)", dim: "var(--green-dim)", label: "Hoạt động",  icon: "dot" },
 };
 

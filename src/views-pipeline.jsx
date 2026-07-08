@@ -1,148 +1,164 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { PIPELINES, STAGE_PRESETS, buildLogScript } from './data.jsx';
-import { Avatar, Breadcrumb, Button, Card, Icon, Input, STATUS_META, SectionLabel, StatusBadge, StatusDot, Tag, fmtDur } from './primitives.jsx';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Breadcrumb, Button, Card, Icon, Input, STATUS_META, SectionLabel, StatusBadge, StatusDot, Tag, fmtDur } from './primitives.jsx';
 import { Page, PageHeader } from './layout.jsx';
 import { EmptyConnectState } from './views-dashboard.jsx';
-import { Meta } from './views-build-history.jsx';
+import { ApiPipelineCard, TriggerModal } from './views-repos.jsx';
+import { listRepoPipelines } from './api/pipelines.js';
+import { listBuilds, getBuildStats, getBuild, getBuildLogs, buildLogsDownloadUrl, getBuildStages, getStageLog, rerunBuild, deleteBuild } from './api/builds.js';
 
 /* ============================================================
-   Views — Pipelines list, Pipeline detail, Run detail (live logs)
+   Views — Pipelines list, Pipeline detail, Build detail
+   Toàn bộ dữ liệu build là proxy real-time từ Jenkins (xem docs/api/builds.md):
+   Jenkins không kết nối được → 502 UPSTREAM_ERROR trên mọi endpoint build.
    ============================================================ */
 
-function PipelinesList({ repos, account, onNav, onTriggerBuild, toast }) {
+/* Jenkins build status → key trong STATUS_META */
+const BUILD_STATUS_MAP = { success: "success", failure: "failed", running: "running", queued: "queued", aborted: "aborted", error: "failed" };
+const mapBuildStatus = (s) => BUILD_STATUS_MAP[s] || "queued";
+
+/* wfapi stage status → key trong STATUS_META */
+const WF_STATUS_MAP = { SUCCESS: "success", FAILED: "failed", IN_PROGRESS: "running", ABORTED: "aborted", NOT_EXECUTED: "queued", UNSTABLE: "unstable" };
+const mapStageStatus = (s) => WF_STATUS_MAP[s] || "queued";
+
+const fmtMs = (ms) => (ms == null ? "—" : fmtDur(Math.round(ms / 1000)));
+const fmtTime = (iso) => (iso ? new Date(iso).toLocaleString("vi-VN", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit", year: "numeric" }) : "—");
+const isJenkinsDown = (e) => e?.code === "UPSTREAM_ERROR";
+
+/* Gọi GET /repositories/:id/pipelines cho từng repo đã map, gộp lại kèm repo context */
+async function fetchAllPipelines(repos) {
+  const lists = await Promise.all(repos.map((r) =>
+    listRepoPipelines(r.id).then((data) => (data ?? []).map((p) => ({ ...p, repo: r }))).catch(() => [])
+  ));
+  return lists.flat();
+}
+
+/* Gọi GET /pipelines/:id/builds cho từng pipeline đã có sẵn (từ fetchAllPipelines), gộp lại kèm
+   pipeline+repo context, sắp theo thời gian mới nhất. Jenkins chết → jenkinsDown=true, builds=[]. */
+async function fetchBuildsForPipelines(pipelines) {
+  if (pipelines.length === 0) return { builds: [], jenkinsDown: false };
+  let jenkinsDown = false;
+  const lists = await Promise.all(pipelines.map((p) =>
+    listBuilds(p.id)
+      .then((data) => (data ?? []).map((b) => ({ ...b, pipeline: p, repo: p.repo })))
+      .catch((e) => { if (isJenkinsDown(e)) jenkinsDown = true; return []; })
+  ));
+  const builds = lists.flat().sort((a, b) => new Date(b.started_at || 0) - new Date(a.started_at || 0));
+  return { builds, jenkinsDown };
+}
+
+/* ---------------- Jenkins-unavailable strip ---------------- */
+function JenkinsDownCard({ onRetry }) {
+  return (
+    <Card style={{ padding: 36, textAlign: "center" }}>
+      <div style={{ width: 52, height: 52, borderRadius: 14, background: "var(--amber-dim)", display: "grid", placeItems: "center", margin: "0 auto 16px" }}>
+        <Icon name="jenkins" size={24} style={{ color: "var(--amber)" }} />
+      </div>
+      <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>Không kết nối được Jenkins</div>
+      <p style={{ fontSize: 13, color: "var(--text-2)", maxWidth: 420, margin: "0 auto 18px", lineHeight: 1.5 }}>
+        Dữ liệu build được đọc trực tiếp từ Jenkins. Kiểm tra Jenkins server đang chạy rồi thử lại.
+      </p>
+      {onRetry && <Button variant="secondary" icon="refresh" onClick={onRetry}>Thử lại</Button>}
+    </Card>
+  );
+}
+
+/* ============================================================
+   Pipelines list — dữ liệu thật, tổng hợp mọi repo
+   ============================================================ */
+function PipelinesList({ repos, account, onNav, toast }) {
   const [q, setQ] = useState("");
-  const [sel, setSel] = useState(null);
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [triggerTarget, setTriggerTarget] = useState(null);
+
+  useEffect(() => {
+    if (!account.connected || repos.length === 0) { setItems([]); setLoading(false); return; }
+    let cancelled = false;
+    setLoading(true);
+    fetchAllPipelines(repos).then((all) => { if (!cancelled) setItems(all); }).finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [repos, account.connected]);
+
+  async function refresh() {
+    setLoading(true);
+    try { setItems(await fetchAllPipelines(repos)); } finally { setLoading(false); }
+  }
+
   if (!account.connected) {
     return <Page><PageHeader title="Pipeline" icon="pipeline" subtitle="Quản lý tập trung toàn bộ pipeline đã đồng bộ." /><EmptyConnectState onNav={onNav} /></Page>;
   }
-  const items = PIPELINES.map((p) => ({ ...p, repo: repos.find((r) => r.id === p.repoId) })).filter((p) => p.repo)
-    .filter((p) => p.title.toLowerCase().includes(q.toLowerCase()) || p.repo.name.toLowerCase().includes(q.toLowerCase()) || p.name.toLowerCase().includes(q.toLowerCase()));
 
-  const selP = items.find((p) => p.id === sel);
-  function releaseChange() {
-    if (!selP) return;
-    const id = onTriggerBuild(selP.id);
-    onNav({ view: "run", pipelineId: selP.id, runId: id, live: true });
-  }
-
-  const COLS = "36px 1.4fr 1fr 1.5fr 1fr 1fr";
+  const filtered = items.filter((p) =>
+    p.name.toLowerCase().includes(q.toLowerCase()) ||
+    p.repo.name.toLowerCase().includes(q.toLowerCase()) ||
+    p.repo.fullName.toLowerCase().includes(q.toLowerCase()));
 
   return (
     <Page wide>
       <PageHeader title="Pipeline" icon="pipeline"
-        subtitle="Toàn bộ pipeline được đồng bộ từ GitHub Actions trong .github/workflows, quản lý tập trung."
+        subtitle="Toàn bộ pipeline được đồng bộ từ .viettelcloud/workflows/ trên các repository đã ánh xạ."
         actions={<>
-          <Button variant="secondary" icon="refresh" onClick={() => toast && toast("Đang đồng bộ lại từ GitHub…", "info")} />
-          <Button variant="secondary" icon="clock" disabled={!selP} onClick={() => onNav({ view: "pipeline", pipelineId: sel })}>View history</Button>
-          <Button variant="secondary" icon="play" disabled={!selP} onClick={releaseChange}>Release change</Button>
-          <Button variant="secondary" icon="trash" disabled={!selP} onClick={() => toast && toast(`Xác nhận xoá pipeline ${selP.title}?`, "info")}>Delete pipeline</Button>
-          <Button variant="primary" icon="plus" onClick={() => onNav({ view: "create-pipeline" })}>Create pipeline</Button>
+          <Button variant="secondary" icon="refresh" loading={loading} onClick={refresh}>Tải lại</Button>
+          <Button variant="primary" icon="plus" onClick={() => onNav({ view: "create-pipeline" })}>Đồng bộ pipeline</Button>
         </>} />
 
       <div style={{ display: "flex", gap: 10, marginBottom: 14, alignItems: "center" }}>
-        <Input value={q} onChange={setQ} placeholder="Tìm pipeline theo tên…" icon="search" full />
+        <Input value={q} onChange={setQ} placeholder="Tìm theo tên pipeline hoặc repository…" icon="search" full />
       </div>
 
-      {items.length === 0 ? (
+      {loading ? (
+        <Card style={{ padding: 44, textAlign: "center" }}>
+          <Icon name="sync" size={22} style={{ color: "var(--text-3)", animation: "spin .7s linear infinite", margin: "0 auto 10px", display: "block" }} />
+          <span style={{ fontSize: 13.5, color: "var(--text-3)" }}>Đang tải pipeline…</span>
+        </Card>
+      ) : repos.length === 0 ? (
+        <Card style={{ padding: 48, textAlign: "center" }}>
+          <div style={{ width: 52, height: 52, borderRadius: 14, background: "var(--panel-2)", border: "1px solid var(--border)", display: "grid", placeItems: "center", margin: "0 auto 16px" }}>
+            <Icon name="repo" size={24} style={{ color: "var(--text-3)" }} />
+          </div>
+          <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>Chưa có repository nào được ánh xạ</div>
+          <p style={{ fontSize: 13, color: "var(--text-2)", maxWidth: 440, margin: "0 auto 20px", lineHeight: 1.5 }}>
+            Pipeline được đồng bộ từ repository. Hãy thêm ít nhất một repository trước.
+          </p>
+          <Button variant="primary" icon="plus" onClick={() => onNav({ view: "repos" })}>Đến trang Repository</Button>
+        </Card>
+      ) : items.length === 0 ? (
         <Card style={{ padding: 48, textAlign: "center" }}>
           <div style={{ width: 52, height: 52, borderRadius: 14, background: "var(--panel-2)", border: "1px solid var(--border)", display: "grid", placeItems: "center", margin: "0 auto 16px" }}>
             <Icon name="pipeline" size={24} style={{ color: "var(--text-3)" }} />
           </div>
           <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>Chưa có pipeline nào</div>
           <p style={{ fontSize: 13, color: "var(--text-2)", maxWidth: 440, margin: "0 auto 20px", lineHeight: 1.5 }}>
-            Pipeline không tự sinh ra. Hãy quét một repository để phát hiện file GitHub Actions và parse thành pipeline được quản lý.
+            Pipeline không tự sinh ra. Vào từng repository và bấm "Đồng bộ lại" để quét file <span className="mono">.viettelcloud/workflows/*.yaml</span>.
           </p>
-          <Button variant="primary" icon="plus" onClick={() => onNav({ view: "create-pipeline" })}>Create pipeline</Button>
+          <Button variant="primary" icon="repo" onClick={() => onNav({ view: "repos" })}>Đến trang Repository</Button>
         </Card>
+      ) : filtered.length === 0 ? (
+        <div style={{ padding: 40, textAlign: "center", color: "var(--text-3)", fontSize: 13.5 }}>Không tìm thấy pipeline nào.</div>
       ) : (
-        <Card pad={0} style={{ overflow: "hidden" }}>
-          <div style={{ display: "grid", gridTemplateColumns: COLS, padding: "12px 18px", borderBottom: "1px solid var(--border)",
-            fontSize: 11.5, fontWeight: 600, letterSpacing: ".04em", textTransform: "uppercase", color: "var(--text-3)" }}>
-            <span /><span>Name</span><span>Latest execution status</span><span>Latest source revisions</span><span>Latest execution started</span><span>Most recent executions</span>
-          </div>
-          {items.map((p, i) => {
-            const isSel = sel === p.id;
-            const last = p.runs[0];
-            return (
-              <div key={p.id} onClick={() => setSel(isSel ? null : p.id)}
-                style={{ display: "grid", gridTemplateColumns: COLS, padding: "15px 18px", alignItems: "center",
-                  cursor: "pointer", borderBottom: i < items.length - 1 ? "1px solid var(--border)" : "none",
-                  background: isSel ? "var(--accent-dim)" : "transparent", transition: "background .12s" }}
-                onMouseEnter={(e) => { if (!isSel) e.currentTarget.style.background = "var(--panel-2)"; }}
-                onMouseLeave={(e) => { if (!isSel) e.currentTarget.style.background = "transparent"; }}>
-                <span style={{ width: 17, height: 17, borderRadius: 99, border: `1.5px solid ${isSel ? "var(--accent)" : "var(--border-strong)"}`, display: "grid", placeItems: "center" }}>
-                  {isSel && <span style={{ width: 8, height: 8, borderRadius: 99, background: "var(--accent)" }} />}
-                </span>
-                <button onClick={(e) => { e.stopPropagation(); onNav({ view: "pipeline", pipelineId: p.id }); }}
-                  style={{ textAlign: "left", overflow: "hidden" }}>
-                  <div style={{ fontSize: 13.5, fontWeight: 560, color: "var(--accent)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.title}</div>
-                  <div className="mono" style={{ fontSize: 11, color: "var(--text-3)", marginTop: 2 }}>{p.name}</div>
-                </button>
-                <span>{last ? <StatusBadge status={p.status} size="sm" /> : <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>Chưa chạy</span>}</span>
-                <div style={{ minWidth: 0 }}>
-                  {last ? (
-                    <>
-                      <div style={{ fontSize: 12.5 }}>
-                        <span style={{ fontWeight: 600 }}>Source</span>
-                        <span style={{ color: "var(--text-3)" }}> – </span>
-                        <a href={p.repo.fullName ? "https://github.com/" + p.repo.fullName : "#"} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}
-                          className="mono" style={{ color: "var(--accent)" }}>{typeof last.commit === "string" ? last.commit.slice(0, 7) : last.commit}</a>
-                      </div>
-                      <div style={{ fontSize: 12, color: "var(--text-2)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{last.message}</div>
-                    </>
-                  ) : <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>—</span>}
-                </div>
-                <span style={{ fontSize: 12.5, color: "var(--text-2)" }}>{last ? last.startedAt : "—"}</span>
-                <span>
-                  {last
-                    ? <button onClick={(e) => { e.stopPropagation(); onNav({ view: "run", pipelineId: p.id, runId: last.id }); }}
-                        style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12.5, fontWeight: 540, color: "var(--accent)" }}>
-                        <StatusDot status={p.status} size={8} />View details</button>
-                    : <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>No executions yet</span>}
-                </span>
-              </div>
-            );
-          })}
-        </Card>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {filtered.map((p) => (
+            <ApiPipelineCard key={p.id} pipeline={p} repo={p.repo} onNav={onNav} onTrigger={setTriggerTarget} />
+          ))}
+        </div>
       )}
+
+      <TriggerModal
+        open={!!triggerTarget}
+        onClose={() => setTriggerTarget(null)}
+        pipeline={triggerTarget}
+        defaultRef={triggerTarget?.repo?.syncBranch || triggerTarget?.repo?.defaultBranch || "main"}
+        onTriggered={(build) => {
+          refresh();
+          if (build?.build_number > 0 && triggerTarget) onNav({ view: "run", pipelineId: triggerTarget.id, runId: build.build_number });
+        }}
+        toast={toast}
+      />
     </Page>
   );
 }
 
-/* ---------------- Stage flow graph ---------------- */
-function StageFlow({ stages, compact }) {
-  return (
-    <div style={{ display: "flex", alignItems: "stretch", gap: 0, overflowX: "auto", padding: compact ? "4px 0" : "2px 0" }}>
-      {stages.map((s, i) => {
-        const m = STATUS_META[s.status] || STATUS_META.queued;
-        return (
-          <React.Fragment key={i}>
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, minWidth: compact ? 90 : 108 }}>
-              <div style={{ position: "relative", width: 34, height: 34, borderRadius: 99, border: `1.5px solid ${s.status === "queued" || s.status === "skipped" ? "var(--border-strong)" : m.color}`,
-                background: s.status === "success" ? m.dim : s.status === "running" ? m.dim : "var(--panel)", display: "grid", placeItems: "center", color: m.color }}>
-                {s.status === "running"
-                  ? <Icon name="refresh" size={16} style={{ animation: "spin .8s linear infinite" }} />
-                  : s.status === "success" ? <Icon name="check" size={16} strokeWidth={2.5} />
-                  : s.status === "failed" ? <Icon name="x" size={16} strokeWidth={2.5} />
-                  : <span style={{ width: 7, height: 7, borderRadius: 99, background: "var(--text-3)" }} />}
-                {s.status === "running" && <span style={{ position: "absolute", inset: -4, borderRadius: 99, border: "1.5px solid var(--amber)", opacity: .3, animation: "pulse-dot 1.2s ease-in-out infinite" }} />}
-              </div>
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontSize: 12, fontWeight: 540, color: s.status === "queued" ? "var(--text-3)" : "var(--text)", whiteSpace: "nowrap" }}>{s.name}</div>
-                {!compact && <div className="mono" style={{ fontSize: 11, color: "var(--text-3)", marginTop: 2 }}>{s.duration ? fmtDur(s.duration) : s.status === "running" ? "…" : "—"}</div>}
-              </div>
-            </div>
-            {i < stages.length - 1 && (
-              <div style={{ flex: 1, minWidth: 16, height: 1.5, background: stages[i + 1].status !== "queued" && s.status === "success" ? m.color : "var(--border-strong)", marginTop: 17, alignSelf: "flex-start" }} />
-            )}
-          </React.Fragment>
-        );
-      })}
-    </div>
-  );
-}
-
-/* ---------------- Pipeline detail (Jenkins-style: sub-nav + builds) ---------------- */
+/* ---------------- Sub-nav (dùng chung cho pipeline detail & build detail) ---------------- */
 function PipeSubNav({ items, active, onSelect }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -166,304 +182,6 @@ function PipeSubNav({ items, active, onSelect }) {
   );
 }
 
-function BuildsPanel({ runs, onOpen, activeRunId }) {
-  const [q, setQ] = useState("");
-  const list = runs.filter((r) => ("#" + r.number + " " + (r.message || "")).toLowerCase().includes(q.toLowerCase()));
-  return (
-    <Card pad={0} style={{ overflow: "hidden" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 14px 10px" }}>
-        <span style={{ fontSize: 13.5, fontWeight: 600, letterSpacing: "-.01em" }}>Builds</span>
-        <span style={{ fontSize: 11.5, color: "var(--text-3)" }}>{runs.length}</span>
-      </div>
-      <div style={{ padding: "0 12px 10px" }}>
-        <Input value={q} onChange={setQ} placeholder="Lọc…" icon="search" full />
-      </div>
-      <div style={{ maxHeight: 320, overflowY: "auto", padding: "2px 8px 10px" }}>
-        {list.length ? list.map((r) => {
-          const on = activeRunId === r.id;
-          return (
-            <button key={r.id} onClick={() => onOpen(r)}
-              style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px 9px", borderRadius: "var(--r-sm)", textAlign: "left",
-                background: on ? "var(--accent-dim)" : "transparent", transition: "background .12s" }}
-              onMouseEnter={(e) => { if (!on) e.currentTarget.style.background = "var(--panel-2)"; }}
-              onMouseLeave={(e) => { if (!on) e.currentTarget.style.background = "transparent"; }}>
-              <StatusDot status={r.status} size={9} />
-              <span className="mono tnum" style={{ fontSize: 12.5, fontWeight: 560, width: 34 }}>#{r.number}</span>
-              <span style={{ fontSize: 12, color: "var(--text-3)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.startedAt}</span>
-              <Icon name="chevronRight" size={14} style={{ color: "var(--text-3)" }} />
-            </button>
-          );
-        }) : <div style={{ padding: "16px 10px", fontSize: 12.5, color: "var(--text-3)", textAlign: "center" }}>Chưa có build nào.</div>}
-      </div>
-    </Card>
-  );
-}
-
-function PermalinkRow({ icon, label, run, onOpen }) {
-  return (
-    <button onClick={() => run && onOpen(run)} disabled={!run}
-      style={{ display: "flex", alignItems: "center", gap: 11, padding: "11px 14px", width: "100%", textAlign: "left",
-        borderRadius: "var(--r-sm)", cursor: run ? "pointer" : "default", transition: "background .12s" }}
-      onMouseEnter={(e) => { if (run) e.currentTarget.style.background = "var(--panel-2)"; }}
-      onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
-      <Icon name={icon} size={15} style={{ color: "var(--text-3)", flexShrink: 0 }} />
-      <span style={{ fontSize: 13.5, color: "var(--text-2)" }}>{label}</span>
-      {run ? <>
-        <span className="mono" style={{ fontSize: 12.5, color: "var(--accent)", fontWeight: 560 }}>#{run.number}</span>
-        <span style={{ fontSize: 12.5, color: "var(--text-3)", marginLeft: "auto" }}>{run.startedAt}</span>
-      </> : <span style={{ fontSize: 12.5, color: "var(--text-3)", marginLeft: "auto" }}>—</span>}
-    </button>
-  );
-}
-
-/* ---------------- Stage matrix (build × stage, grouped by date) ---------------- */
-function MatrixNode({ status }) {
-  const m = STATUS_META[status] || STATUS_META.queued;
-  const hollow = status === "queued" || status === "skipped";
-  return (
-    <div style={{ width: 30, height: 30, borderRadius: 99, flexShrink: 0, display: "grid", placeItems: "center",
-      border: `1.5px solid ${hollow ? "var(--border-strong)" : m.color}`,
-      background: hollow ? "transparent" : m.dim, color: m.color, position: "relative" }}>
-      {status === "running"
-        ? <Icon name="refresh" size={14} style={{ animation: "spin .8s linear infinite" }} />
-        : status === "success" ? <Icon name="check" size={14} strokeWidth={2.6} />
-        : status === "failed" ? <Icon name="x" size={14} strokeWidth={2.6} />
-        : <span style={{ width: 6, height: 6, borderRadius: 99, background: "var(--border-strong)" }} />}
-      {status === "running" && <span style={{ position: "absolute", inset: -4, borderRadius: 99, border: "1.5px solid var(--amber)", opacity: .3, animation: "pulse-dot 1.2s ease-in-out infinite" }} />}
-    </div>
-  );
-}
-const HollowDot = () => <span style={{ width: 9, height: 9, borderRadius: 99, border: "1.5px solid var(--border-strong)", flexShrink: 0 }} />;
-const Conn = ({ on }) => <span style={{ width: 20, height: 2, background: on ? "var(--green)" : "var(--border-strong)", flexShrink: 0, opacity: on ? .55 : 1 }} />;
-
-function StageFlowRow({ stages }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center" }}>
-      <HollowDot />
-      {stages.map((s, i) => (
-        <React.Fragment key={i}>
-          <Conn on={s.status === "success" || s.status === "running" || s.status === "failed"} />
-          <span title={`${s.name}${s.duration ? " · " + fmtDur(s.duration) : ""}`}><MatrixNode status={s.status} /></span>
-        </React.Fragment>
-      ))}
-      <Conn on={stages.length > 0 && stages[stages.length - 1].status === "success"} />
-      <HollowDot />
-    </div>
-  );
-}
-
-function runGroupLabel(startedAt) {
-  const s = (startedAt || "").toLowerCase();
-  if (s.includes("vừa") || s.includes("phút") || s.includes("giờ")) return "Hôm nay";
-  if (s.includes("hôm qua")) return "Hôm qua";
-  return "Trước đó";
-}
-
-function StageMatrix({ runs, stageNames, onOpen }) {
-  if (!runs.length) {
-    return <Card style={{ padding: 36, textAlign: "center", color: "var(--text-3)", fontSize: 13.5 }}>Chưa có lần chạy nào để hiển thị stage.</Card>;
-  }
-  const order = ["Hôm nay", "Hôm qua", "Trước đó"];
-  const groups = {};
-  runs.forEach((r) => { const g = runGroupLabel(r.startedAt); (groups[g] = groups[g] || []).push(r); });
-
-  return (
-    <div>
-      {stageNames.length > 0 && (
-        <div style={{ display: "flex", alignItems: "center", gap: 16, padding: "0 4px 12px", marginLeft: 168, flexWrap: "wrap" }}>
-          {stageNames.map((n, i) => (
-            <span key={i} style={{ fontSize: 11, color: "var(--text-3)", fontWeight: 500, display: "inline-flex", alignItems: "center", gap: 5 }}>
-              <span className="mono" style={{ opacity: .6 }}>{i + 1}</span>{n}
-            </span>
-          ))}
-        </div>
-      )}
-      {order.filter((g) => groups[g]).map((g) => (
-        <div key={g} style={{ marginBottom: 8 }}>
-          <div style={{ fontSize: 12, color: "var(--text-3)", fontWeight: 540, padding: "10px 4px 8px" }}>{g}</div>
-          <Card pad={0} style={{ overflow: "hidden" }}>
-            {groups[g].map((r, i) => (
-              <button key={r.id} onClick={() => onOpen(r)}
-                style={{ display: "flex", alignItems: "center", gap: 16, width: "100%", padding: "13px 16px", textAlign: "left",
-                  borderBottom: i < groups[g].length - 1 ? "1px solid var(--border)" : "none", transition: "background .12s" }}
-                onMouseEnter={(e) => e.currentTarget.style.background = "var(--panel-2)"}
-                onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, width: 152, flexShrink: 0 }}>
-                  <StatusDot status={r.status} size={11} />
-                  <div>
-                    <div className="mono" style={{ fontSize: 13.5, fontWeight: 600 }}>#{r.number}</div>
-                    <div style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 1 }}>{r.startedAt}{r.duration ? " · " + fmtDur(r.duration) : ""}</div>
-                  </div>
-                </div>
-                <div style={{ overflowX: "auto" }}><StageFlowRow stages={r.stages} /></div>
-              </button>
-            ))}
-          </Card>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function PipelineDetail({ pipelineId, repos, onNav, onTriggerBuild, toast }) {
-  const p = PIPELINES.find((x) => x.id === pipelineId);
-  const [section, setSection] = useState("status");
-  if (!p) return <Page><div style={{ color: "var(--text-3)" }}>Không tìm thấy pipeline.</div></Page>;
-  const repo = repos.find((r) => r.id === p.repoId);
-  const last = p.runs[0];
-  const stageNames = p.stages || STAGE_PRESETS[p.preset] || [];
-  const flowStages = last ? last.stages : stageNames.map((n) => ({ name: n, status: "queued", duration: 0 }));
-  const openRun = (r) => onNav({ view: "run", pipelineId: p.id, runId: r.id });
-  const runBuild = () => { const id = onTriggerBuild(p.id); onNav({ view: "run", pipelineId: p.id, runId: id, live: true }); };
-
-  const lastSuccess = p.runs.find((r) => r.status === "success");
-  const lastCompleted = p.runs.find((r) => r.status !== "running");
-
-  const navItems = [
-    { id: "status", label: "Trạng thái", icon: "file" },
-    { id: "changes", label: "Thay đổi", icon: "code" },
-    { id: "build", label: "Chạy pipeline", icon: "play", onClick: runBuild },
-    { id: "configure", label: "Cấu hình", icon: "settings" },
-    { id: "stages", label: "Các bước (Stages)", icon: "layers" },
-    { id: "hook", label: "Nhật ký webhook", icon: "webhook" },
-    { divider: true, id: "d1" },
-    { id: "delete", label: "Xoá pipeline", icon: "trash", danger: true, onClick: () => toast(`Xác nhận xoá pipeline ${p.title}?`, "info") },
-  ];
-
-  return (
-    <Page full>
-      <PageHeader icon="pipeline" title={p.title}
-        breadcrumb={[{ label: "Pipeline", to: { view: "pipelines" } }, { label: repo?.name, to: { view: "repo", repoId: repo?.id }, mono: true }, { label: p.name, mono: true }]} onNav={onNav}
-        subtitle={<span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><Icon name="github" size={13} /><span className="mono" style={{ fontSize: 12.5 }}>{repo?.fullName} · {p.path || ".github/workflows/" + p.name}</span></span>}
-        actions={<Button variant="primary" icon="play" onClick={runBuild}>Chạy pipeline</Button>} />
-
-      <div style={{ display: "grid", gridTemplateColumns: "236px 1fr", gap: 20, alignItems: "start" }}>
-        {/* Left column: sub-nav + builds */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 16, position: "sticky", top: 16 }}>
-          <PipeSubNav items={navItems} active={section} onSelect={setSection} />
-          <BuildsPanel runs={p.runs} onOpen={openRun} />
-        </div>
-
-        {/* Right column: content */}
-        <div style={{ minWidth: 0 }}>
-          {section === "status" && (
-            <div>
-              <div style={{ display: "flex", alignItems: "center", gap: 13, marginBottom: 8 }}>
-                <StatusDot status={p.status} size={18} />
-                <h2 style={{ fontSize: 24, fontWeight: 640, letterSpacing: "-.03em" }}>{p.title}</h2>
-                <StatusBadge status={p.status} />
-              </div>
-              <div style={{ fontSize: 13.5, color: "var(--text-2)", marginBottom: 26 }}>
-                Tên đầy đủ: <span className="mono">{repo?.fullName} · {p.name}</span>
-              </div>
-
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 26 }}>
-                <MiniStat label="Tỉ lệ thành công" value={p.runs.length ? p.successRate + "%" : "—"} />
-                <MiniStat label="Thời lượng TB" value={p.runs.length ? fmtDur(p.avgDuration) : "—"} />
-                <MiniStat label="Tổng số build" value={p.runs.length} />
-              </div>
-
-              <SectionLabel style={{ marginBottom: 10 }}>Permalinks</SectionLabel>
-              <Card pad={6} style={{ marginBottom: 26 }}>
-                <PermalinkRow icon="clock" label="Build gần nhất" run={last} onOpen={openRun} />
-                <PermalinkRow icon="checkCircle" label="Build thành công gần nhất" run={lastSuccess} onOpen={openRun} />
-                <PermalinkRow icon="check" label="Build hoàn tất gần nhất" run={lastCompleted} onOpen={openRun} />
-              </Card>
-
-              <SectionLabel style={{ marginBottom: 12 }}>Sơ đồ các bước</SectionLabel>
-              <Card>{last || stageNames.length ? <StageFlow stages={flowStages} /> : <span style={{ fontSize: 13, color: "var(--text-3)" }}>—</span>}</Card>
-            </div>
-          )}
-
-          {section === "changes" && (
-            <div>
-              <h2 style={{ fontSize: 20, fontWeight: 620, letterSpacing: "-.02em", marginBottom: 4 }}>Thay đổi</h2>
-              <div style={{ fontSize: 13, color: "var(--text-3)", marginBottom: 18 }}>Commit gắn với từng lần chạy của pipeline.</div>
-              {p.runs.length ? (
-                <Card pad={0} style={{ overflow: "hidden" }}>
-                  {p.runs.map((r, i) => (
-                    <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 13, padding: "13px 16px", borderBottom: i < p.runs.length - 1 ? "1px solid var(--border)" : "none" }}>
-                      <Avatar initials={r.avatar} size={26} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13.5, fontWeight: 540, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.message}</div>
-                        <div style={{ fontSize: 12, color: "var(--text-3)", marginTop: 2, display: "flex", gap: 10 }}>
-                          <span>{r.author}</span><span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon name="branch" size={11} />{r.branch}</span>
-                        </div>
-                      </div>
-                      <a href={repo ? `https://github.com/${repo.fullName}/commit/${r.commit}` : "#"} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}
-                        className="mono" style={{ fontSize: 12.5, color: "var(--accent)" }}>{typeof r.commit === "string" ? r.commit.slice(0, 7) : r.commit}</a>
-                      <button onClick={() => openRun(r)} className="mono tnum" style={{ fontSize: 12, color: "var(--text-3)" }}>#{r.number}</button>
-                    </div>
-                  ))}
-                </Card>
-              ) : <Card style={{ padding: 36, textAlign: "center", color: "var(--text-3)", fontSize: 13.5 }}>Chưa có thay đổi nào.</Card>}
-            </div>
-          )}
-
-          {section === "configure" && (
-            <div>
-              <h2 style={{ fontSize: 20, fontWeight: 620, letterSpacing: "-.02em", marginBottom: 18 }}>Cấu hình</h2>
-              <Card style={{ marginBottom: 16 }}>
-                <SectionLabel style={{ marginBottom: 14 }}>Nguồn</SectionLabel>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 18 }}>
-                  <Meta label="Repository" value={repo?.fullName} mono />
-                  <Meta label="File workflow" value={p.path || ".github/workflows/" + p.name} mono />
-                  <Meta label="Nhánh" value={<span className="mono">{p.branchFilter || repo?.mappedBranch || "main"}</span>} />
-                  <Meta label="Nguồn parse" value={p.parsedFrom || "GitHub Actions"} />
-                </div>
-              </Card>
-              <Card style={{ marginBottom: 16 }}>
-                <SectionLabel style={{ marginBottom: 14 }}>Trigger</SectionLabel>
-                <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>{p.triggers.map((t) => <Tag key={t} mono>{t}</Tag>)}</div>
-              </Card>
-              {p.env && Object.keys(p.env).length > 0 && (
-                <Card>
-                  <SectionLabel style={{ marginBottom: 14 }}>Biến môi trường</SectionLabel>
-                  <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>{Object.entries(p.env).map(([k, v]) => <Tag key={k} mono>{k}={v}</Tag>)}</div>
-                </Card>
-              )}
-            </div>
-          )}
-
-          {section === "stages" && (
-            <div>
-              <h2 style={{ fontSize: 20, fontWeight: 620, letterSpacing: "-.02em", marginBottom: 4 }}>Các bước (Stages)</h2>
-              <div style={{ fontSize: 13, color: "var(--text-3)", marginBottom: 18 }}>Tiến trình stage của từng lần chạy, nhóm theo thời gian. Bấm một dòng để xem chi tiết.</div>
-              <StageMatrix runs={p.runs} stageNames={stageNames} onOpen={openRun} />
-            </div>
-          )}
-
-          {section === "hook" && (
-            <div>
-              <h2 style={{ fontSize: 20, fontWeight: 620, letterSpacing: "-.02em", marginBottom: 18 }}>Lần GitHub Push gần nhất</h2>
-              <Card style={{ background: "var(--code-bg)" }}>
-                {last ? (
-                  <div className="mono" style={{ fontSize: 12.5, lineHeight: 1.9, color: "var(--text-2)" }}>
-                    <div>Bắt đầu lúc {last.startedAt} · build #{last.number}</div>
-                    <div>Kích hoạt bởi sự kiện từ <span style={{ color: "var(--text)" }}>10.5.0.11</span> ⇒ <a href={repo ? `https://github.com/${repo.fullName}` : "#"} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>https://ci.fpt-cloud/github-webhook/</a></div>
-                    <div style={{ color: "var(--text-3)" }}>Nhánh <span className="mono" style={{ color: "var(--text-2)" }}>{last.branch}</span> · commit {typeof last.commit === "string" ? last.commit.slice(0, 7) : last.commit}</div>
-                    <div style={{ color: "var(--green)" }}>Tìm thấy thay đổi (Changes found)</div>
-                    <div>Hoàn tất · Took 2 ms</div>
-                  </div>
-                ) : <div style={{ fontSize: 13, color: "var(--text-3)" }}>Chưa nhận được sự kiện push nào từ GitHub.</div>}
-              </Card>
-              <div style={{ margintop: 14 }} />
-              <Card style={{ marginTop: 16 }}>
-                <SectionLabel style={{ marginBottom: 12 }}>Cấu hình webhook</SectionLabel>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 18 }}>
-                  <Meta label="Payload URL" value="https://ci.fpt-cloud/github-webhook/" mono />
-                  <Meta label="Sự kiện" value={<div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>{p.triggers.map((t) => <Tag key={t} mono>{t}</Tag>)}</div>} />
-                </div>
-                <button onClick={() => onNav({ view: "webhooks" })} style={{ fontSize: 12.5, color: "var(--accent)", fontWeight: 540, marginTop: 14 }}>Quản lý webhook →</button>
-              </Card>
-            </div>
-          )}
-        </div>
-      </div>
-    </Page>
-  );
-}
-
 function MiniStat({ label, value }) {
   return (
     <Card pad={15}>
@@ -473,159 +191,367 @@ function MiniStat({ label, value }) {
   );
 }
 
-function RunRow({ run: r, onClick, last }) {
+/* ---------------- Builds panel (danh sách build từ Jenkins) ---------------- */
+function BuildsPanel({ builds, onOpen, activeNumber }) {
+  const [q, setQ] = useState("");
+  const list = builds.filter((b) => ("#" + b.number).includes(q));
   return (
-    <div onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 13, padding: "13px 18px", cursor: "pointer",
-      borderBottom: last ? "none" : "1px solid var(--border)", transition: "background .12s" }}
-      onMouseEnter={(e) => e.currentTarget.style.background = "var(--panel-2)"}
-      onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
-      <StatusDot status={r.status} size={9} />
-      <span className="mono tnum" style={{ fontSize: 12.5, color: "var(--text-3)", width: 42 }}>#{r.number}</span>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 13.5, fontWeight: 540, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.message}</div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 3, fontSize: 12, color: "var(--text-3)" }}>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon name="branch" size={11} />{r.branch}</span>
-          <span className="mono">{typeof r.commit === "string" ? r.commit.slice(0, 7) : r.commit}</span>
-          <Tag mono>{r.trigger}</Tag>
-        </div>
+    <Card pad={0} style={{ overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 14px 10px" }}>
+        <span style={{ fontSize: 13.5, fontWeight: 600, letterSpacing: "-.01em" }}>Builds</span>
+        <span style={{ fontSize: 11.5, color: "var(--text-3)" }}>{builds.length}</span>
       </div>
-      <Avatar initials={r.avatar} size={24} />
-      <span style={{ fontSize: 12, color: "var(--text-3)", width: 90, textAlign: "right" }}>{fmtDur(r.duration)}</span>
-      <span style={{ fontSize: 12, color: "var(--text-3)", width: 92, textAlign: "right" }}>{r.startedAt}</span>
-      <Icon name="chevronRight" size={16} style={{ color: "var(--text-3)" }} />
-    </div>
+      <div style={{ padding: "0 12px 10px" }}>
+        <Input value={q} onChange={setQ} placeholder="Lọc theo số build…" icon="search" full />
+      </div>
+      <div style={{ maxHeight: 320, overflowY: "auto", padding: "2px 8px 10px" }}>
+        {list.length ? list.map((b) => {
+          const on = activeNumber === b.number;
+          return (
+            <button key={b.number} onClick={() => onOpen(b)}
+              style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px 9px", borderRadius: "var(--r-sm)", textAlign: "left",
+                background: on ? "var(--accent-dim)" : "transparent", transition: "background .12s" }}
+              onMouseEnter={(e) => { if (!on) e.currentTarget.style.background = "var(--panel-2)"; }}
+              onMouseLeave={(e) => { if (!on) e.currentTarget.style.background = "transparent"; }}>
+              <StatusDot status={mapBuildStatus(b.status)} size={9} />
+              <span className="mono tnum" style={{ fontSize: 12.5, fontWeight: 560, width: 40 }}>#{b.number}</span>
+              <span style={{ fontSize: 11.5, color: "var(--text-3)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{fmtTime(b.started_at)}</span>
+              <Icon name="chevronRight" size={14} style={{ color: "var(--text-3)" }} />
+            </button>
+          );
+        }) : <div style={{ padding: "16px 10px", fontSize: 12.5, color: "var(--text-3)", textAlign: "center" }}>Chưa có build nào.</div>}
+      </div>
+    </Card>
   );
 }
 
-/* ---------------- Run detail — Pipeline Overview style ---------------- */
-function RunDetail({ pipelineId, runId, live, repos, onNav, onRunComplete, toast }) {
-  const p = PIPELINES.find((x) => x.id === pipelineId);
-  const repo = repos.find((r) => r.id === p?.repoId);
-  const baseRun = p?.runs.find((r) => r.id === runId);
-  const stageNames = p ? (p.stages || STAGE_PRESETS[p.preset]) : [];
-  const agent = "default-" + (runId || "x").replace(/[^a-z0-9]/gi, "").slice(-5).padStart(5, "x");
+function PermalinkRow({ icon, label, buildRef, onOpen }) {
+  return (
+    <button onClick={() => buildRef && onOpen(buildRef.number)} disabled={!buildRef}
+      style={{ display: "flex", alignItems: "center", gap: 11, padding: "11px 14px", width: "100%", textAlign: "left",
+        borderRadius: "var(--r-sm)", cursor: buildRef ? "pointer" : "default", transition: "background .12s" }}
+      onMouseEnter={(e) => { if (buildRef) e.currentTarget.style.background = "var(--panel-2)"; }}
+      onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+      <Icon name={icon} size={15} style={{ color: "var(--text-3)", flexShrink: 0 }} />
+      <span style={{ fontSize: 13.5, color: "var(--text-2)" }}>{label}</span>
+      {buildRef ? <>
+        <span className="mono" style={{ fontSize: 12.5, color: "var(--accent)", fontWeight: 560 }}>#{buildRef.number}</span>
+        <span style={{ marginLeft: "auto" }}><StatusBadge status={mapBuildStatus(buildRef.status)} size="sm" /></span>
+      </> : <span style={{ fontSize: 12.5, color: "var(--text-3)", marginLeft: "auto" }}>—</span>}
+    </button>
+  );
+}
 
-  const [stages, setStages] = useState(() => live ? stageNames.map((n) => ({ name: n, status: "queued", duration: 0 })) : baseRun?.stages || []);
-  const [logsByStage, setLogsByStage] = useState({});
-  const [status, setStatus] = useState(live ? "running" : baseRun?.status);
-  const [elapsed, setElapsed] = useState(0);
-  const [sel, setSel] = useState(0);
+/* ============================================================
+   Pipeline detail — stats + lịch sử build (Jenkins) + Jenkinsfile
+   ============================================================ */
+function PipelineDetail({ pipelineId, repos, onNav, toast }) {
+  const [pipeline, setPipeline] = useState(null);
+  const [plLoading, setPlLoading] = useState(true);
+  const [builds, setBuilds] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [buildsErr, setBuildsErr] = useState(null);
+  const [buildsLoading, setBuildsLoading] = useState(true);
   const [section, setSection] = useState("status");
-  const [autoscroll, setAutoscroll] = useState(true);
-  const logRef = useRef(null);
-  const followRef = useRef(true);
+  const [triggerOpen, setTriggerOpen] = useState(false);
 
-  // static per-stage logs for finished runs
+  // Không có GET /pipelines/:id — tìm pipeline qua danh sách pipeline của các repo đã map.
   useEffect(() => {
-    if (!live && baseRun) {
-      const map = {};
-      baseRun.stages.forEach((s, i) => {
-        if (s.status === "skipped" || s.status === "queued") { map[i] = [{ level: "meta", text: "Stage bị bỏ qua." }]; return; }
-        const lines = buildLogScript([s.name]).filter((l) => l.level !== "group");
-        if (s.status === "failed") {
-          lines.push({ level: "error", text: `✗ ${s.name} thất bại — exit code 1` });
-          lines.push({ level: "error", text: "Pipeline dừng do stage thất bại." });
-        } else { lines.push({ level: "ok", text: `✓ ${s.name} hoàn tất · ${fmtDur(s.duration)}` }); }
-        map[i] = lines;
-      });
-      setLogsByStage(map);
-      const failIdx = baseRun.stages.findIndex((s) => s.status === "failed");
-      setSel(failIdx >= 0 ? failIdx : Math.max(0, baseRun.stages.filter((s) => s.status === "success").length - 1));
+    let cancelled = false;
+    setPlLoading(true);
+    fetchAllPipelines(repos)
+      .then((all) => { if (!cancelled) setPipeline(all.find((p) => p.id === pipelineId) || null); })
+      .finally(() => { if (!cancelled) setPlLoading(false); });
+    return () => { cancelled = true; };
+  }, [pipelineId, repos]);
+
+  const loadBuilds = useCallback(async () => {
+    setBuildsLoading(true);
+    try {
+      const [b, s] = await Promise.all([listBuilds(pipelineId), getBuildStats(pipelineId)]);
+      setBuilds(b ?? []);
+      setStats(s);
+      setBuildsErr(null);
+    } catch (e) {
+      setBuildsErr(e);
+    } finally {
+      setBuildsLoading(false);
     }
-  }, [live, runId]);
+  }, [pipelineId]);
 
-  // live streaming
-  useEffect(() => {
-    if (!live) return;
-    let stageIdx = 0, lineQueue = [], done = false;
-    const tick = setInterval(() => setElapsed((e) => e + 1), 1000);
-    const startStage = (i) => {
-      setStages((prev) => prev.map((s, idx) => idx === i ? { ...s, status: "running" } : s));
-      if (followRef.current) setSel(i);
-      const lines = buildLogScript([stageNames[i]]).filter((l) => l.level !== "group" && l.level !== "meta");
-      lineQueue = [{ level: "meta", text: `Bắt đầu stage ${stageNames[i]} · agent ${agent}` }, ...lines];
-      setLogsByStage((prev) => ({ ...prev, [i]: [] }));
-    };
-    const finishStage = (i) => {
-      const dur = 6 + Math.floor(Math.random() * 24);
-      setStages((prev) => prev.map((s, idx) => idx === i ? { ...s, status: "success", duration: dur } : s));
-      setLogsByStage((prev) => ({ ...prev, [i]: [...(prev[i] || []), { level: "ok", text: `✓ ${stageNames[i]} hoàn tất · ${fmtDur(dur)}` }] }));
-    };
-    startStage(0);
-    const drip = setInterval(() => {
-      if (done) return;
-      if (lineQueue.length > 0) {
-        const line = lineQueue.shift();
-        setLogsByStage((prev) => ({ ...prev, [stageIdx]: [...(prev[stageIdx] || []), line] }));
-      } else {
-        finishStage(stageIdx);
-        stageIdx++;
-        if (stageIdx >= stageNames.length) {
-          done = true; clearInterval(drip); clearInterval(tick);
-          setStatus("success");
-          onRunComplete?.(pipelineId, runId, "success");
-        } else { startStage(stageIdx); }
-      }
-    }, 520);
-    return () => { clearInterval(drip); clearInterval(tick); };
-  }, [live]);
+  useEffect(() => { loadBuilds(); }, [loadBuilds]);
 
-  useEffect(() => { if (autoscroll && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [logsByStage, sel, autoscroll]);
+  if (plLoading) {
+    return <Page><Card style={{ padding: 44, textAlign: "center" }}>
+      <Icon name="sync" size={22} style={{ color: "var(--text-3)", animation: "spin .7s linear infinite", margin: "0 auto 10px", display: "block" }} />
+      <span style={{ fontSize: 13.5, color: "var(--text-3)" }}>Đang tải pipeline…</span>
+    </Card></Page>;
+  }
+  if (!pipeline) return <Page><div style={{ color: "var(--text-3)" }}>Không tìm thấy pipeline.</div></Page>;
 
-  if (!p || (!baseRun && !live)) return <Page><div style={{ color: "var(--text-3)" }}>Không tìm thấy lần chạy.</div></Page>;
-  const run = baseRun || { number: "—", branch: "main", commit: "live", message: "Build thủ công", author: "you", avatar: "ME", trigger: "manual", startedAt: "vừa xong" };
-
-  // prev/next build navigation
-  const idx = p.runs.findIndex((r) => r.id === runId);
-  const prevRun = idx >= 0 && idx < p.runs.length - 1 ? p.runs[idx + 1] : null; // older
-  const nextRun = idx > 0 ? p.runs[idx - 1] : null; // newer
-  const selStage = stages[sel];
-  const selLogs = logsByStage[sel] || [];
-
-  // derived timings
-  const totalSec = (live || status === "running") ? elapsed : (run.duration || 0);
-  const waitSec = Math.min(13, Math.max(2, Math.round(totalSec * 0.12)));
-  const buildSec = Math.max(0, totalSec - waitSec);
-  // flat console (all stages in order)
-  const flatLogs = stages.flatMap((s, i) => {
-    const head = { level: "group", text: `[Pipeline] { (${s.name})` };
-    return [head, ...(logsByStage[i] || [])];
-  });
-  const runningIdx = stages.findIndex((s) => s.status === "running");
+  const repo = pipeline.repo;
+  const openRun = (number) => onNav({ view: "run", pipelineId, runId: number });
 
   const navItems = [
-    { id: "status", label: "Trạng thái", icon: "file" },
-    { id: "changes", label: "Thay đổi", icon: "code" },
+    { id: "status", label: "Trạng thái", icon: "activity" },
+    { id: "build", label: "Build pipeline", icon: "play", onClick: () => setTriggerOpen(true) },
+  ];
+
+  return (
+    <Page full>
+      <PageHeader icon="pipeline" title={pipeline.name}
+        breadcrumb={[{ label: "Pipeline", to: { view: "pipelines" } }, { label: repo?.name, to: { view: "repo", repoId: repo?.id }, mono: true }, { label: pipeline.name, mono: true }]} onNav={onNav}
+        subtitle={<span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><Icon name="github" size={13} /><span className="mono" style={{ fontSize: 12.5 }}>{repo?.fullName} · {pipeline.file_path}</span></span>}
+        actions={<>
+          <Button variant="secondary" icon="refresh" loading={buildsLoading} onClick={loadBuilds}>Tải lại</Button>
+          <Button variant="primary" icon="play" onClick={() => setTriggerOpen(true)}>Build</Button>
+        </>} />
+
+      <div style={{ display: "grid", gridTemplateColumns: "236px 1fr", gap: 20, alignItems: "start" }}>
+        {/* Left: sub-nav + builds */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16, position: "sticky", top: 16 }}>
+          <PipeSubNav items={navItems} active={section} onSelect={setSection} />
+          {!buildsErr && <BuildsPanel builds={builds} onOpen={(b) => openRun(b.number)} />}
+        </div>
+
+        {/* Right: content */}
+        <div style={{ minWidth: 0 }}>
+          {section === "status" && (
+            buildsErr ? (isJenkinsDown(buildsErr)
+              ? <JenkinsDownCard onRetry={loadBuilds} />
+              : <Card style={{ padding: 36, textAlign: "center", color: "var(--red)", fontSize: 13.5 }}>{buildsErr.message || "Không tải được dữ liệu build."}</Card>
+            ) : (
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 13, marginBottom: 8 }}>
+                  <h2 style={{ fontSize: 24, fontWeight: 640, letterSpacing: "-.03em" }}>{pipeline.name}</h2>
+                  {pipeline.status !== "pending" && <StatusBadge status={pipeline.status === "error" ? "failed" : pipeline.status} />}
+                </div>
+                <div style={{ fontSize: 13.5, color: "var(--text-2)", marginBottom: 26 }}>
+                  <span className="mono">{repo?.fullName} · {pipeline.file_path}</span>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 26 }}>
+                  <MiniStat label="Tỉ lệ thành công" value={stats?.success_rate != null ? Math.round(stats.success_rate * 100) + "%" : "—"} />
+                  <MiniStat label="Thời lượng TB" value={stats?.avg_duration_ms != null ? fmtMs(stats.avg_duration_ms) : "—"} />
+                  <MiniStat label="Tổng số build" value={stats?.total_builds ?? 0} />
+                </div>
+
+                <SectionLabel style={{ marginBottom: 10 }}>Permalinks</SectionLabel>
+                <Card pad={6} style={{ marginBottom: 26 }}>
+                  <PermalinkRow icon="clock" label="Build gần nhất" buildRef={stats?.latest} onOpen={openRun} />
+                  <PermalinkRow icon="checkCircle" label="Build thành công gần nhất" buildRef={stats?.latest_success} onOpen={openRun} />
+                  <PermalinkRow icon="check" label="Build hoàn tất gần nhất" buildRef={stats?.latest_completed} onOpen={openRun} />
+                </Card>
+
+                <SectionLabel style={{ marginBottom: 10 }}>Lịch sử build</SectionLabel>
+                {buildsLoading ? (
+                  <Card style={{ padding: 30, textAlign: "center" }}>
+                    <Icon name="sync" size={18} style={{ color: "var(--text-3)", animation: "spin .7s linear infinite", margin: "0 auto", display: "block" }} />
+                  </Card>
+                ) : builds.length === 0 ? (
+                  <Card style={{ padding: 36, textAlign: "center", color: "var(--text-3)", fontSize: 13.5 }}>
+                    Chưa có build nào — bấm <b>Build</b> để chạy lần đầu.
+                  </Card>
+                ) : (
+                  <Card pad={0} style={{ overflow: "hidden" }}>
+                    {builds.map((b, i) => (
+                      <div key={b.number} onClick={() => openRun(b.number)}
+                        style={{ display: "flex", alignItems: "center", gap: 13, padding: "13px 18px", cursor: "pointer",
+                          borderBottom: i < builds.length - 1 ? "1px solid var(--border)" : "none", transition: "background .12s" }}
+                        onMouseEnter={(e) => e.currentTarget.style.background = "var(--panel-2)"}
+                        onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+                        <StatusDot status={mapBuildStatus(b.status)} size={9} />
+                        <span className="mono tnum" style={{ fontSize: 13, fontWeight: 600, width: 52 }}>#{b.number}</span>
+                        <StatusBadge status={mapBuildStatus(b.status)} size="sm" />
+                        <div style={{ flex: 1 }} />
+                        <span className="mono tnum" style={{ fontSize: 12.5, color: "var(--text-2)", width: 80, textAlign: "right" }}>
+                          {b.status === "running" || b.status === "queued" ? "…" : fmtMs(b.duration_ms)}
+                        </span>
+                        <span style={{ fontSize: 12, color: "var(--text-3)", width: 140, textAlign: "right" }}>{fmtTime(b.started_at)}</span>
+                        <Icon name="chevronRight" size={15} style={{ color: "var(--text-3)" }} />
+                      </div>
+                    ))}
+                  </Card>
+                )}
+              </div>
+            )
+          )}
+
+        </div>
+      </div>
+
+      <TriggerModal
+        open={triggerOpen}
+        onClose={() => setTriggerOpen(false)}
+        pipeline={pipeline}
+        defaultRef={repo?.syncBranch || repo?.defaultBranch || "main"}
+        onTriggered={(build) => {
+          loadBuilds();
+          if (build?.build_number > 0) openRun(build.build_number);
+        }}
+        toast={toast}
+      />
+    </Page>
+  );
+}
+
+/* ============================================================
+   Build detail — trạng thái, console log, stages, timings (real-time từ Jenkins)
+   ============================================================ */
+function RunDetail({ pipelineId, runId, repos, onNav, toast }) {
+  const number = Number(runId);
+  const [pipeline, setPipeline] = useState(null);
+  const [build, setBuild] = useState(null);
+  const [stages, setStages] = useState([]);
+  const [logs, setLogs] = useState(null);
+  const [stageLogs, setStageLogs] = useState({});      // stageId -> text
+  const [selStage, setSelStage] = useState(null);      // stage id
+  const [section, setSection] = useState("status");
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [, tick] = useState(0);                        // re-render mỗi giây khi build đang chạy (elapsed)
+  const logRef = useRef(null);
+  const sectionRef = useRef(section);
+  sectionRef.current = section;
+
+  useEffect(() => {
+    fetchAllPipelines(repos).then((all) => setPipeline(all.find((p) => p.id === pipelineId) || null));
+  }, [pipelineId, repos]);
+
+  const isLive = build && (build.status === "running" || build.status === "queued");
+
+  const load = useCallback(async () => {
+    try {
+      const [b, st] = await Promise.all([
+        getBuild(pipelineId, number),
+        getBuildStages(pipelineId, number).catch(() => []),
+      ]);
+      setBuild(b);
+      setStages(st ?? []);
+      setErr(null);
+      // console đang mở → cập nhật log cùng nhịp
+      if (sectionRef.current === "console") {
+        getBuildLogs(pipelineId, number).then(setLogs).catch(() => {});
+      }
+    } catch (e) {
+      setErr(e);
+    } finally {
+      setLoading(false);
+    }
+  }, [pipelineId, number]);
+
+  useEffect(() => { setLoading(true); setLogs(null); setStageLogs({}); setSelStage(null); load(); }, [load]);
+
+  // poll khi build đang chạy + tick cho elapsed
+  useEffect(() => {
+    if (!isLive) return;
+    const poll = setInterval(load, 3000);
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => { clearInterval(poll); clearInterval(t); };
+  }, [isLive, load]);
+
+  // load console lần đầu khi mở section
+  useEffect(() => {
+    if (section === "console" && logs == null && build) {
+      getBuildLogs(pipelineId, number).then(setLogs).catch((e) => setLogs(`(không tải được log: ${e.message})`));
+    }
+  }, [section, logs, build, pipelineId, number]);
+
+  useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [logs]);
+
+  async function openStage(id) {
+    setSelStage(id);
+    if (stageLogs[id] == null) {
+      try {
+        const text = await getStageLog(pipelineId, number, id);
+        setStageLogs((m) => ({ ...m, [id]: text }));
+      } catch (e) {
+        setStageLogs((m) => ({ ...m, [id]: `(không tải được log stage: ${e.message})` }));
+      }
+    }
+  }
+
+  async function doRerun() {
+    try {
+      const b = await rerunBuild(pipelineId, number);
+      toast?.(b?.build_number > 0 ? `Đã bắt đầu build #${b.build_number}` : "Build đã vào hàng đợi Jenkins", "success");
+      if (b?.build_number > 0) onNav({ view: "run", pipelineId, runId: b.build_number });
+    } catch (e) {
+      toast?.(e.message || "Rerun thất bại", "error");
+    }
+  }
+
+  async function doDelete() {
+    try {
+      await deleteBuild(pipelineId, number);
+      toast?.(`Đã xoá build #${number} khỏi Jenkins`, "info");
+      onNav({ view: "pipeline", pipelineId });
+    } catch (e) {
+      toast?.(e.message || "Xoá thất bại", "error");
+    }
+  }
+
+  if (loading) {
+    return <Page><Card style={{ padding: 44, textAlign: "center" }}>
+      <Icon name="sync" size={22} style={{ color: "var(--text-3)", animation: "spin .7s linear infinite", margin: "0 auto 10px", display: "block" }} />
+      <span style={{ fontSize: 13.5, color: "var(--text-3)" }}>Đang tải build #{number}…</span>
+    </Card></Page>;
+  }
+  if (err) {
+    return <Page>
+      <div style={{ marginBottom: 16 }}>
+        <Breadcrumb items={[{ label: "Pipeline", to: { view: "pipelines" } }, { label: pipeline?.name || "…", to: { view: "pipeline", pipelineId } }, { label: "#" + number, mono: true }]} onNav={onNav} />
+      </div>
+      {isJenkinsDown(err)
+        ? <JenkinsDownCard onRetry={() => { setLoading(true); load(); }} />
+        : <Card style={{ padding: 36, textAlign: "center", color: "var(--text-3)", fontSize: 13.5 }}>{err.message || "Không tìm thấy build."}</Card>}
+    </Page>;
+  }
+
+  const status = mapBuildStatus(build.status);
+  const elapsedMs = isLive && build.started_at ? Date.now() - Date.parse(build.started_at) : null;
+  const durationMs = isLive ? elapsedMs : build.duration_ms;
+  const t = build.timings;
+  const selStageObj = stages.find((s) => s.id === selStage);
+
+  const navItems = [
+    { id: "status", label: "Trạng thái", icon: "activity" },
     { id: "console", label: "Console Output", icon: "terminal" },
+    { id: "overview", label: "Các bước (Stages)", icon: "pipeline" },
     { id: "timings", label: "Timings", icon: "clock" },
-    { id: "overview", label: "Pipeline Overview", icon: "pipeline" },
     { divider: true, id: "d1" },
-    { id: "rerun", label: "Chạy lại (Rerun)", icon: "refresh", onClick: () => toast("Đang chạy lại pipeline…", "info") },
-    { id: "del", label: "Xoá build #" + run.number, icon: "trash", danger: true, onClick: () => toast(`Xác nhận xoá build #${run.number}?`, "info") },
+    { id: "rerun", label: "Chạy lại (Rerun)", icon: "refresh", onClick: doRerun },
+    { id: "del", label: "Xoá build #" + number, icon: "trash", danger: true, onClick: () => setConfirmDelete(true) },
   ];
 
   return (
     <Page full>
       <div style={{ marginBottom: 12 }}>
-        <Breadcrumb items={[{ label: "Pipeline", to: { view: "pipelines" } }, { label: p.title, to: { view: "pipeline", pipelineId: p.id } }, { label: "#" + run.number, mono: true }]} onNav={onNav} />
+        <Breadcrumb items={[{ label: "Pipeline", to: { view: "pipelines" } }, { label: pipeline?.name || "pipeline", to: { view: "pipeline", pipelineId } }, { label: "#" + number, mono: true }]} onNav={onNav} />
       </div>
 
-      {/* header row */}
+      {/* header */}
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 18, flexWrap: "wrap" }}>
         <StatusDot status={status} size={20} />
-        <h1 className="mono" style={{ fontSize: 23, fontWeight: 680, letterSpacing: "-.02em" }}>#{run.number}</h1>
-        <div style={{ display: "flex", gap: 4 }}>
-          <button onClick={() => prevRun && onNav({ view: "run", pipelineId: p.id, runId: prevRun.id })} disabled={!prevRun}
-            title="Build trước" style={{ width: 30, height: 30, borderRadius: "var(--r-sm)", display: "grid", placeItems: "center", border: "1px solid var(--border)", background: "var(--panel)", color: prevRun ? "var(--text-2)" : "var(--text-3)", opacity: prevRun ? 1 : .4 }}><Icon name="chevronLeft" size={15} /></button>
-          <button onClick={() => nextRun && onNav({ view: "run", pipelineId: p.id, runId: nextRun.id })} disabled={!nextRun}
-            title="Build sau" style={{ width: 30, height: 30, borderRadius: "var(--r-sm)", display: "grid", placeItems: "center", border: "1px solid var(--border)", background: "var(--panel)", color: nextRun ? "var(--text-2)" : "var(--text-3)", opacity: nextRun ? 1 : .4 }}><Icon name="chevronRight" size={15} /></button>
-        </div>
-        <span style={{ fontSize: 13.5, color: "var(--text-3)" }}>{run.startedAt}</span>
+        <h1 className="mono" style={{ fontSize: 23, fontWeight: 680, letterSpacing: "-.02em" }}>#{number}</h1>
+        <StatusBadge status={status} />
+        <span style={{ fontSize: 13.5, color: "var(--text-3)" }}>{fmtTime(build.started_at)}</span>
         <div style={{ flex: 1 }} />
-        {status === "running"
-          ? <Button variant="danger" icon="x" onClick={() => toast("Đã yêu cầu huỷ pipeline", "info")}>Huỷ</Button>
-          : <Button variant="primary" icon="refresh" onClick={() => toast("Đang chạy lại pipeline…", "info")}>Rerun</Button>}
+        <Button variant="primary" icon="refresh" onClick={doRerun}>Rerun</Button>
       </div>
+
+      {/* confirm delete strip */}
+      {confirmDelete && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "13px 18px", marginBottom: 18,
+          background: "var(--red-dim)", border: "1px solid color-mix(in oklab, var(--red) 35%, transparent)",
+          borderRadius: "var(--r-md)", fontSize: 13.5 }}>
+          <Icon name="xCircle" size={18} style={{ color: "var(--red)", flexShrink: 0 }} />
+          <span style={{ flex: 1 }}>Xoá build #{number} khỏi Jenkins — <b>không khôi phục được</b>.</span>
+          <Button variant="ghost" onClick={() => setConfirmDelete(false)}>Huỷ</Button>
+          <Button variant="danger" onClick={doDelete}>Xác nhận xoá</Button>
+        </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "212px 1fr", gap: 20, alignItems: "start" }}>
         <div style={{ position: "sticky", top: 16 }}><PipeSubNav items={navItems} active={section} onSelect={setSection} /></div>
@@ -633,89 +559,115 @@ function RunDetail({ pipelineId, runId, live, repos, onNav, onRunComplete, toast
         <div style={{ minWidth: 0 }}>
           {/* STATUS */}
           {section === "status" && (
-            <div>
-              <div style={{ display: "flex", alignItems: "center", gap: 13, marginBottom: 24 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 13 }}>
                 <StatusDot status={status} size={18} />
-                <h2 className="mono" style={{ fontSize: 21, fontWeight: 640, letterSpacing: "-.02em" }}>#{run.number}</h2>
+                <h2 className="mono" style={{ fontSize: 21, fontWeight: 640, letterSpacing: "-.02em" }}>#{number}</h2>
                 <StatusBadge status={status} />
                 <div style={{ flex: 1 }} />
                 <div style={{ textAlign: "right", fontSize: 12.5, color: "var(--text-3)" }}>
-                  <div>Bắt đầu {run.startedAt}</div>
-                  <div>Mất <span className="mono" style={{ color: "var(--text-2)" }}>{fmtDur(totalSec)}</span></div>
+                  <div>Bắt đầu {fmtTime(build.started_at)}</div>
+                  <div>{isLive ? "Đang chạy" : "Mất"} <span className="mono" style={{ color: "var(--text-2)" }}>{fmtMs(durationMs)}</span>{isLive && build.estimated_ms > 0 && <> / ước lượng <span className="mono">{fmtMs(build.estimated_ms)}</span></>}</div>
                 </div>
               </div>
 
-              <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
-                <div style={{ display: "flex", gap: 14 }}>
-                  <Icon name="clock" size={20} style={{ color: "var(--text-3)", flexShrink: 0, marginTop: 1 }} />
-                  <div style={{ fontSize: 14 }}>{run.trigger === "manual" ? <>Chạy thủ công bởi <a style={{ color: "var(--accent)" }}>{run.author}</a></> : <>Kích hoạt bởi webhook GitHub · <span className="mono">{run.branch}</span></>}</div>
-                </div>
-
-                <div style={{ display: "flex", gap: 14 }}>
-                  <Icon name="activity" size={20} style={{ color: "var(--text-3)", flexShrink: 0, marginTop: 1 }} />
-                  <div>
-                    <div style={{ fontSize: 14, marginBottom: 8 }}>Lần chạy này mất:</div>
-                    <ul style={{ listStyle: "disc", paddingLeft: 20, fontSize: 13.5, color: "var(--text-2)", display: "flex", flexDirection: "column", gap: 5 }}>
-                      <li><span className="mono">{fmtDur(waitSec)}</span> chờ trong hàng đợi;</li>
-                      <li><span className="mono">{fmtDur(buildSec)}</span> thời lượng build;</li>
-                      <li><span className="mono">{fmtDur(totalSec)}</span> tổng từ lúc lên lịch đến khi hoàn tất.</li>
-                    </ul>
-                  </div>
-                </div>
-
-                <div style={{ display: "flex", gap: 14 }}>
-                  <Icon name="commit" size={20} style={{ color: "var(--text-3)", flexShrink: 0, marginTop: 1 }} />
-                  <div style={{ fontSize: 13.5, lineHeight: 1.7 }}>
-                    <div><b>Revision:</b> <span className="mono" style={{ color: "var(--text-2)" }}>{typeof run.commit === "string" ? run.commit : String(run.commit)}{typeof run.commit === "string" && run.commit.length < 12 ? "0c290876e6ece347bab5dee14d0eaefb".slice(0, 40 - run.commit.length) : ""}</span></div>
-                    <div><b>Repository:</b> <a href={repo ? `https://github.com/${repo.fullName}.git` : "#"} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>https://github.com/{repo?.fullName}.git</a></div>
-                    <ul style={{ listStyle: "disc", paddingLeft: 20, marginTop: 6, color: "var(--text-3)" }}><li className="mono">refs/remotes/origin/{run.branch}</li></ul>
-                  </div>
-                </div>
-
-                <div style={{ display: "flex", gap: 14 }}>
-                  <Icon name="code" size={20} style={{ color: "var(--text-3)", flexShrink: 0, marginTop: 1 }} />
-                  <div style={{ fontSize: 14 }}>{run.message ? <><b>Thay đổi:</b> {run.message}</> : "Không có thay đổi."}</div>
+              <div style={{ display: "flex", gap: 14 }}>
+                <Icon name="clock" size={20} style={{ color: "var(--text-3)", flexShrink: 0, marginTop: 1 }} />
+                <div style={{ fontSize: 14 }}>
+                  {build.trigger_type
+                    ? <>Kích hoạt <span className="mono">{build.trigger_type}</span>{build.branch && <> · nhánh <span className="mono">{build.branch}</span></>}</>
+                    : "Build được tạo ngoài platform (trực tiếp trên Jenkins)."}
                 </div>
               </div>
-            </div>
-          )}
 
-          {/* CHANGES */}
-          {section === "changes" && (
-            <div>
-              <h2 style={{ fontSize: 20, fontWeight: 620, letterSpacing: "-.02em", marginBottom: 18 }}>Thay đổi</h2>
-              <Card pad={0} style={{ overflow: "hidden" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 13, padding: "14px 16px" }}>
-                  <Avatar initials={run.avatar} size={28} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13.5, fontWeight: 540 }}>{run.message}</div>
-                    <div style={{ fontSize: 12, color: "var(--text-3)", marginTop: 2, display: "flex", gap: 10 }}><span>{run.author}</span><span style={{ display: "flex", alignItems: "center", gap: 4 }}><Icon name="branch" size={11} />{run.branch}</span></div>
-                  </div>
-                  <a href={repo ? `https://github.com/${repo.fullName}/commit/${run.commit}` : "#"} target="_blank" rel="noreferrer" className="mono" style={{ fontSize: 12.5, color: "var(--accent)" }}>{typeof run.commit === "string" ? run.commit.slice(0, 7) : run.commit}</a>
+              <div style={{ display: "flex", gap: 14 }}>
+                <Icon name="commit" size={20} style={{ color: "var(--text-3)", flexShrink: 0, marginTop: 1 }} />
+                <div style={{ fontSize: 13.5, lineHeight: 1.7, minWidth: 0 }}>
+                  <div><b>Revision:</b> <span className="mono" style={{ color: "var(--text-2)", wordBreak: "break-all" }}>{build.commit?.sha || "—"}</span></div>
+                  {build.repo_url && <div><b>Repository:</b> <a href={build.repo_url.replace(/\.git$/, "")} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>{build.repo_url}</a></div>}
+                  {(build.commit?.message || build.commit?.author) && (
+                    <div style={{ color: "var(--text-2)" }}>
+                      {build.commit.message}{build.commit.author && <span style={{ color: "var(--text-3)" }}> — {build.commit.author}</span>}
+                    </div>
+                  )}
                 </div>
-              </Card>
-              <div style={{ fontSize: 12.5, color: "var(--text-3)", marginTop: 12 }}>Hiển thị commit kích hoạt lần chạy này. Diff chi tiết xem trên GitHub.</div>
+              </div>
+
+              {stages.length > 0 && (
+                <div>
+                  <SectionLabel style={{ marginBottom: 12 }}>Sơ đồ các bước</SectionLabel>
+                  <Card><StageFlow stages={stages.map((s) => ({ name: s.name, status: mapStageStatus(s.status), duration: Math.round((s.duration_ms || 0) / 1000) }))} /></Card>
+                </div>
+              )}
             </div>
           )}
 
-          {/* CONSOLE OUTPUT */}
+          {/* CONSOLE */}
           {section === "console" && (
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
                 <Icon name="terminal" size={20} style={{ color: "var(--accent)" }} />
                 <h2 style={{ fontSize: 20, fontWeight: 620, letterSpacing: "-.02em" }}>Console Output</h2>
-                {status === "running" && <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--amber)" }}><span style={{ width: 6, height: 6, borderRadius: 99, background: "var(--amber)", animation: "pulse-dot 1.1s infinite" }} />trực tiếp</span>}
+                {isLive && <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--amber)" }}><span style={{ width: 6, height: 6, borderRadius: 99, background: "var(--amber)", animation: "pulse-dot 1.1s infinite" }} />trực tiếp</span>}
                 <div style={{ flex: 1 }} />
-                <Button variant="ghost" size="sm" icon="download" onClick={() => toast("Đang tải logs…", "info")}>Tải xuống</Button>
-                <Button variant="ghost" size="sm" icon="copy" onClick={() => toast("Đã sao chép logs", "success")}>Copy</Button>
+                <Button variant="ghost" size="sm" icon="download" onClick={() => window.open(buildLogsDownloadUrl(pipelineId, number), "_blank")}>Tải xuống</Button>
+                <Button variant="ghost" size="sm" icon="copy" onClick={() => { navigator.clipboard?.writeText(logs || ""); toast?.("Đã sao chép logs", "success"); }}>Copy</Button>
               </div>
               <div ref={logRef} className="mono" style={{ background: "var(--code-bg)", border: "1px solid var(--border)", borderRadius: "var(--r-lg)",
-                padding: "14px 4px 14px 0", fontSize: 12.5, lineHeight: 1.7, maxHeight: 560, overflowY: "auto", scrollBehavior: "smooth" }}>
-                <LogLine line={{ level: "meta", text: `Chạy bởi ${run.author}` }} n={0} />
-                <LogLine line={{ level: "info", text: `Lấy cấu hình từ git https://github.com/${repo?.fullName}.git` }} n={1} />
-                {flatLogs.map((l, i) => <LogLine key={i} line={l} n={i + 2} />)}
-                {status === "running" && <div style={{ paddingLeft: 56, color: "var(--amber)" }}><span style={{ display: "inline-block", width: 8, height: 14, background: "var(--amber)", animation: "pulse-dot 1s steps(1) infinite", verticalAlign: "middle" }} /></div>}
+                padding: "14px 16px", fontSize: 12.5, lineHeight: 1.7, maxHeight: 560, overflowY: "auto", scrollBehavior: "smooth" }}>
+                {logs == null
+                  ? <div style={{ color: "var(--text-3)" }}>Đang tải log…</div>
+                  : <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text-2)", fontFamily: "inherit" }}>{logs || "(log trống)"}</pre>}
+                {isLive && <div style={{ color: "var(--amber)" }}><span style={{ display: "inline-block", width: 8, height: 14, background: "var(--amber)", animation: "pulse-dot 1s steps(1) infinite", verticalAlign: "middle" }} /></div>}
               </div>
+            </div>
+          )}
+
+          {/* STAGES / OVERVIEW */}
+          {section === "overview" && (
+            <div>
+              <Card style={{ marginBottom: 16 }}>
+                <SectionLabel style={{ marginBottom: 16 }}>Graph</SectionLabel>
+                {stages.length
+                  ? <StageFlow stages={stages.map((s) => ({ name: s.name, status: mapStageStatus(s.status), duration: Math.round((s.duration_ms || 0) / 1000) }))} />
+                  : <span style={{ fontSize: 13, color: "var(--text-3)" }}>Chưa có dữ liệu stage (build có thể đang khởi động).</span>}
+              </Card>
+              {stages.length > 0 && (
+                <div style={{ display: "grid", gridTemplateColumns: "248px 1fr", gap: 16, alignItems: "start" }}>
+                  <Card pad={6} style={{ overflow: "hidden" }}>
+                    {stages.map((s) => {
+                      const on = selStage === s.id;
+                      const st = mapStageStatus(s.status);
+                      return (
+                        <button key={s.id} onClick={() => openStage(s.id)}
+                          style={{ display: "flex", alignItems: "center", gap: 11, width: "100%", padding: "11px 12px", borderRadius: "var(--r-sm)", textAlign: "left",
+                            background: on ? "var(--accent-dim)" : "transparent", transition: "background .12s" }}
+                          onMouseEnter={(e) => { if (!on) e.currentTarget.style.background = "var(--panel-2)"; }}
+                          onMouseLeave={(e) => { if (!on) e.currentTarget.style.background = "transparent"; }}>
+                          <StatusDot status={st} size={10} />
+                          <span style={{ flex: 1, fontSize: 13.5, fontWeight: on ? 600 : 500, color: on ? "var(--text)" : "var(--text-2)" }}>{s.name}</span>
+                          <span className="mono" style={{ fontSize: 12, color: "var(--text-3)" }}>{st === "running" ? "…" : s.duration_ms ? fmtMs(s.duration_ms) : ""}</span>
+                        </button>
+                      );
+                    })}
+                  </Card>
+                  <div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", border: "1px solid var(--border)", borderRadius: "var(--r-md) var(--r-md) 0 0", borderBottom: "none", background: "var(--panel)" }}>
+                      <span style={{ fontSize: 15, fontWeight: 600 }}>{selStageObj?.name || "Chọn một stage"}</span>
+                      <div style={{ flex: 1 }} />
+                      {selStageObj && <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: "var(--text-3)" }}><Icon name="clock" size={13} />{fmtMs(selStageObj.duration_ms)}</span>}
+                    </div>
+                    <div className="mono" style={{ background: "var(--code-bg)", border: "1px solid var(--border)", borderRadius: "0 0 var(--r-md) var(--r-md)",
+                      padding: "12px 16px", fontSize: 12.5, lineHeight: 1.7, maxHeight: 460, overflowY: "auto" }}>
+                      {selStage == null
+                        ? <span style={{ color: "var(--text-3)" }}>Bấm một stage bên trái để xem log.</span>
+                        : stageLogs[selStage] == null
+                          ? <span style={{ color: "var(--text-3)" }}>Đang tải log…</span>
+                          : <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text-2)", fontFamily: "inherit" }}>{stageLogs[selStage] || "(log trống)"}</pre>}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -723,77 +675,30 @@ function RunDetail({ pipelineId, runId, live, repos, onNav, onRunComplete, toast
           {section === "timings" && (
             <div>
               <h2 style={{ fontSize: 20, fontWeight: 620, letterSpacing: "-.02em", marginBottom: 18 }}>Timings</h2>
-              <Card pad={0} style={{ overflow: "hidden" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr", padding: "13px 18px", borderBottom: "1px solid var(--border)", fontSize: 12.5, fontWeight: 600, color: "var(--text-3)" }}>
-                  <span /><span style={{ textAlign: "center" }}>Primary task</span><span style={{ textAlign: "center" }}>Including subtasks</span>
-                </div>
-                {[
-                  ["In queue · Waiting", "1 ms", "1 ms"],
-                  ["In queue · Blocked", "0 ms", "0 ms"],
-                  ["In queue · Buildable", "0 ms", fmtDur(waitSec)],
-                  ["In queue · Total", "4 ms", fmtDur(waitSec)],
-                  ["Building", fmtDur(totalSec), fmtDur(buildSec)],
-                  ["Scheduled to completion", "", fmtDur(totalSec)],
-                  ["Number of subtasks", "", String(stages.length)],
-                  ["Average executor utilization", "", "0.6"],
-                ].map(([label, a, b], i, arr) => (
-                  <div key={i} style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr", padding: "12px 18px", alignItems: "center", borderBottom: i < arr.length - 1 ? "1px solid var(--border)" : "none", fontSize: 13 }}>
-                    <span style={{ color: "var(--text-2)" }}>{label}</span>
-                    <span className="mono tnum" style={{ textAlign: "center", color: "var(--text)" }}>{a}</span>
-                    <span className="mono tnum" style={{ textAlign: "center", color: "var(--text)" }}>{b}</span>
-                  </div>
-                ))}
-              </Card>
-            </div>
-          )}
-
-          {/* PIPELINE OVERVIEW */}
-          {section === "overview" && (
-            <div>
-              <Card style={{ marginBottom: 16 }}>
-                <SectionLabel style={{ marginBottom: 16 }}>Graph</SectionLabel>
-                <StageFlow stages={stages} />
-              </Card>
-              <div style={{ display: "grid", gridTemplateColumns: "248px 1fr", gap: 16, alignItems: "start" }}>
-                <Card pad={6} style={{ overflow: "hidden" }}>
-                  {stages.map((s, i) => {
-                    const on = sel === i;
-                    return (
-                      <button key={i} onClick={() => { followRef.current = false; setSel(i); }}
-                        style={{ display: "flex", alignItems: "center", gap: 11, width: "100%", padding: "11px 12px", borderRadius: "var(--r-sm)", textAlign: "left",
-                          background: on ? "var(--accent-dim)" : "transparent", transition: "background .12s" }}
-                        onMouseEnter={(e) => { if (!on) e.currentTarget.style.background = "var(--panel-2)"; }}
-                        onMouseLeave={(e) => { if (!on) e.currentTarget.style.background = "transparent"; }}>
-                        <MatrixNode status={s.status} />
-                        <span style={{ flex: 1, fontSize: 13.5, fontWeight: on ? 600 : 500, color: on ? "var(--text)" : "var(--text-2)" }}>{s.name}</span>
-                        <span className="mono" style={{ fontSize: 12, color: "var(--text-3)" }}>{s.status === "running" ? "…" : s.duration ? fmtDur(s.duration) : ""}</span>
-                      </button>
-                    );
-                  })}
+              {t ? (
+                <Card pad={0} style={{ overflow: "hidden" }}>
+                  {[
+                    ["Chờ trong hàng đợi (queue)", fmtMs(t.queue_ms)],
+                    ["· Waiting", fmtMs(t.waiting_ms)],
+                    ["· Blocked", fmtMs(t.blocked_ms)],
+                    ["· Buildable", fmtMs(t.buildable_ms)],
+                    ["Thời lượng build", fmtMs(t.build_ms)],
+                    ["Tổng (lên lịch → hoàn tất)", fmtMs(t.total_ms)],
+                    ["Số subtask", t.subtasks ?? "—"],
+                    ["Executor utilization", t.executor_utilization ?? "—"],
+                  ].map(([label, v], i, arr) => (
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", padding: "12px 18px", alignItems: "center",
+                      borderBottom: i < arr.length - 1 ? "1px solid var(--border)" : "none", fontSize: 13 }}>
+                      <span style={{ color: "var(--text-2)" }}>{label}</span>
+                      <span className="mono tnum" style={{ textAlign: "right", color: "var(--text)" }}>{v}</span>
+                    </div>
+                  ))}
                 </Card>
-                <div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", border: "1px solid var(--border)", borderRadius: "var(--r-md) var(--r-md) 0 0", borderBottom: "none",
-                    background: selStage && (selStage.status === "success" ? "var(--green-dim)" : selStage.status === "failed" ? "var(--red-dim)" : selStage.status === "running" ? "var(--amber-dim)" : "var(--panel)") }}>
-                    <MatrixNode status={selStage?.status || "queued"} />
-                    <span style={{ fontSize: 15, fontWeight: 600 }}>{selStage?.name || "—"}</span>
-                    <div style={{ flex: 1 }} />
-                    <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: "var(--text-3)" }}><Icon name="clock" size={13} />{selStage?.status === "running" ? fmtDur(elapsed) : selStage?.duration ? fmtDur(selStage.duration) : "—"}</span>
-                    <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: "var(--text-3)" }}><Icon name="cpu" size={13} /><span className="mono">{agent}</span></span>
-                    <button onClick={() => toast("Đã sao chép logs", "success")} style={{ color: "var(--text-3)", padding: 3 }}><Icon name="copy" size={15} /></button>
-                  </div>
-                  <div ref={logRef} className="mono" style={{ background: "var(--code-bg)", border: "1px solid var(--border)", borderRadius: "0 0 var(--r-md) var(--r-md)",
-                    padding: "12px 4px 12px 0", fontSize: 12.5, lineHeight: 1.7, maxHeight: 460, overflowY: "auto", scrollBehavior: "smooth" }}>
-                    {selLogs.length ? selLogs.map((l, i) => <LogLine key={i} line={l} n={i} />)
-                      : <div style={{ paddingLeft: 56, color: "var(--text-3)", fontSize: 12.5 }}>{selStage?.status === "queued" ? "Stage chưa chạy." : "Không có log."}</div>}
-                    {status === "running" && sel === runningIdx && <div style={{ paddingLeft: 56, color: "var(--amber)" }}><span style={{ display: "inline-block", width: 8, height: 14, background: "var(--amber)", animation: "pulse-dot 1s steps(1) infinite", verticalAlign: "middle" }} /></div>}
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 8, fontSize: 12, color: "var(--text-3)" }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-                      <input type="checkbox" checked={autoscroll} onChange={(e) => setAutoscroll(e.target.checked)} style={{ accentColor: "var(--accent)" }} />Tự cuộn
-                    </label>
-                  </div>
-                </div>
-              </div>
+              ) : (
+                <Card style={{ padding: 36, textAlign: "center", color: "var(--text-3)", fontSize: 13.5 }}>
+                  Không có dữ liệu timings (Jenkins thiếu plugin metrics, hoặc build chưa hoàn tất).
+                </Card>
+              )}
             </div>
           )}
         </div>
@@ -802,26 +707,41 @@ function RunDetail({ pipelineId, runId, live, repos, onNav, onRunComplete, toast
   );
 }
 
-function LogLine({ line, n }) {
-  const colors = { meta: "var(--text-3)", cmd: "var(--accent)", info: "var(--text-2)", warn: "var(--amber)", error: "var(--red)", ok: "var(--green)", group: "var(--violet)" };
-  if (line.level === "group") {
-    return (
-      <div style={{ display: "flex", gap: 0, padding: "6px 0 4px", marginTop: 4 }}>
-        <span style={{ width: 50, textAlign: "right", paddingRight: 14, color: "var(--text-3)", opacity: .4, flexShrink: 0, userSelect: "none" }}>{n}</span>
-        <span style={{ color: "var(--violet)", fontWeight: 600, display: "flex", alignItems: "center", gap: 7 }}>
-          <Icon name="chevronDown" size={13} />▌ {line.text}
-        </span>
-      </div>
-    );
-  }
+/* ---------------- Stage flow graph (dùng chung) ---------------- */
+function StageFlow({ stages, compact }) {
   return (
-    <div style={{ display: "flex", gap: 0, padding: "0.5px 0" }}
-      onMouseEnter={(e) => e.currentTarget.style.background = "color-mix(in oklab, var(--text) 4%, transparent)"}
-      onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
-      <span style={{ width: 50, textAlign: "right", paddingRight: 14, color: "var(--text-3)", opacity: .4, flexShrink: 0, userSelect: "none" }}>{n}</span>
-      <span style={{ color: colors[line.level] || "var(--text-2)", whiteSpace: "pre-wrap", wordBreak: "break-word", paddingRight: 14 }}>{line.text}</span>
+    <div style={{ display: "flex", alignItems: "stretch", gap: 0, overflowX: "auto", padding: compact ? "4px 0" : "2px 0" }}>
+      {stages.map((s, i) => {
+        const m = STATUS_META[s.status] || STATUS_META.queued;
+        return (
+          <React.Fragment key={i}>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, minWidth: compact ? 90 : 108 }}>
+              <div style={{ position: "relative", width: 34, height: 34, borderRadius: 99, border: `1.5px solid ${s.status === "queued" || s.status === "skipped" ? "var(--border-strong)" : m.color}`,
+                background: s.status === "success" ? m.dim : s.status === "running" ? m.dim : "var(--panel)", display: "grid", placeItems: "center", color: m.color }}>
+                {s.status === "running"
+                  ? <Icon name="refresh" size={16} style={{ animation: "spin .8s linear infinite" }} />
+                  : s.status === "success" ? <Icon name="check" size={16} strokeWidth={2.5} />
+                  : s.status === "failed" ? <Icon name="x" size={16} strokeWidth={2.5} />
+                  : s.status === "aborted" ? <Icon name="stop" size={13} />
+                  : <span style={{ width: 7, height: 7, borderRadius: 99, background: "var(--text-3)" }} />}
+                {s.status === "running" && <span style={{ position: "absolute", inset: -4, borderRadius: 99, border: "1.5px solid var(--amber)", opacity: .3, animation: "pulse-dot 1.2s ease-in-out infinite" }} />}
+              </div>
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 12, fontWeight: 540, color: s.status === "queued" ? "var(--text-3)" : "var(--text)", whiteSpace: "nowrap" }}>{s.name}</div>
+                {!compact && <div className="mono" style={{ fontSize: 11, color: "var(--text-3)", marginTop: 2 }}>{s.duration ? fmtDur(s.duration) : s.status === "running" ? "…" : "—"}</div>}
+              </div>
+            </div>
+            {i < stages.length - 1 && (
+              <div style={{ flex: 1, minWidth: 16, height: 1.5, background: stages[i + 1].status !== "queued" && s.status === "success" ? m.color : "var(--border-strong)", marginTop: 17, alignSelf: "flex-start" }} />
+            )}
+          </React.Fragment>
+        );
+      })}
     </div>
   );
 }
 
-export { PipelinesList, PipelineDetail, RunDetail, StageFlow, MiniStat };
+export {
+  PipelinesList, PipelineDetail, RunDetail, StageFlow, MiniStat,
+  fetchAllPipelines, fetchBuildsForPipelines, JenkinsDownCard, mapBuildStatus, fmtMs, fmtTime, isJenkinsDown,
+};

@@ -16,13 +16,20 @@ const createSourceProvider = ({ provider_type, access_token }) =>
 const deleteSourceProvider = (id) =>
   request("DELETE", `/source-providers/${id}`);
 
-/* GET /source-providers/:id/repositories → Repository[] */
+/* GET /source-providers/:id/repositories → Repository[]
+   Repo đã map vào platform (đọc từ DB). */
 const getSourceProviderRepos = (id) =>
   request("GET", `/source-providers/${id}/repositories`);
 
-/* POST /source-providers/:id/sync → Repository[] */
-const syncSourceProvider = (id) =>
-  request("POST", `/source-providers/${id}/sync`);
+/* GET /source-providers/:id/github-repos → { full_name, owner, name, repo_url, default_branch }[]
+   Live từ GitHub, KHÔNG lưu DB, không có id — dùng để hiển thị cho người dùng chọn repo để map. */
+const getSourceProviderGithubRepos = (id) =>
+  request("GET", `/source-providers/${id}/github-repos`);
+
+/* POST /source-providers/:id/repositories { full_name } → Repository
+   Map đúng một repo cụ thể (chọn từ github-repos) vào platform. Idempotent theo full_name. */
+const mapRepository = (id, fullName) =>
+  request("POST", `/source-providers/${id}/repositories`, { full_name: fullName });
 
 export {
   listSourceProviders,
@@ -30,5 +37,6 @@ export {
   createSourceProvider,
   deleteSourceProvider,
   getSourceProviderRepos,
-  syncSourceProvider,
+  getSourceProviderGithubRepos,
+  mapRepository,
 };

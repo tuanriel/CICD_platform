@@ -145,7 +145,7 @@ function Sidebar({ account }) {
   );
 }
 
-function Topbar({ route, onNav, onSearch, theme, onToggleTheme, navCollapsed, onToggleNav }) {
+function Topbar({ route, onNav, onSearch, theme, onToggleTheme, navCollapsed, onToggleNav, user, onLogin, onLogout }) {
   return (
     <header style={{ height: 56, borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center",
       gap: 14, padding: "0 22px", background: "color-mix(in oklab, var(--bg) 86%, transparent)",
@@ -175,6 +175,27 @@ function Topbar({ route, onNav, onSearch, theme, onToggleTheme, navCollapsed, on
         Pipeline service
         <span style={{ width: 6, height: 6, borderRadius: 99, background: "var(--green)" }} />
       </div>
+
+      {user ? (
+        <>
+          <div title={user.email} style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 11px", borderRadius: 99,
+            background: "var(--panel)", border: "1px solid var(--border)", fontSize: 12.5, color: "var(--text-2)" }}>
+            <Icon name="user" size={13} style={{ color: "var(--accent)" }} />
+            <span style={{ maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.email}</span>
+          </div>
+          <button onClick={onLogout} title="Đăng xuất"
+            style={{ width: 34, height: 34, borderRadius: "var(--r-sm)", display: "grid", placeItems: "center",
+              color: "var(--text-2)", border: "1px solid var(--border)", background: "var(--panel)" }}>
+            <Icon name="logout" size={16} />
+          </button>
+        </>
+      ) : (
+        <button onClick={onLogin} title="Đăng nhập tài khoản platform"
+          style={{ display: "flex", alignItems: "center", gap: 7, height: 34, padding: "0 13px", borderRadius: "var(--r-sm)",
+            color: "var(--text)", border: "1px solid var(--border)", background: "var(--panel)", fontSize: 13, fontWeight: 540 }}>
+          <Icon name="user" size={15} />Đăng nhập
+        </button>
+      )}
 
       <button onClick={onToggleTheme} title="Đổi giao diện sáng/tối"
         style={{ width: 34, height: 34, borderRadius: "var(--r-sm)", display: "grid", placeItems: "center",

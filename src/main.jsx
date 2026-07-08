@@ -1,14 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ReactDOM from 'react-dom/client';
-import { BrowserRouter, Routes, Route, Navigate, useNavigate, useParams, useLocation, useSearchParams } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useNavigate, useParams, useLocation } from 'react-router-dom';
 import './index.css';
-import { listSourceProviders, deleteSourceProvider, syncSourceProvider } from './api/source-providers.js';
+import { listSourceProviders, deleteSourceProvider } from './api/source-providers.js';
 import { listRepositories, deleteRepository } from './api/repositories.js';
+import { getAuthToken, setAuthToken, onUnauthorized } from './api/client.js';
+import { me as apiMe } from './api/auth.js';
 import { TweakColor, TweakRadio, TweakSection, TweakSlider, TweaksPanel, useTweaks } from './tweaks-panel.jsx';
-import { PIPELINES, STAGE_PRESETS } from './data.jsx';
 import { Icon, Tag, Toast } from './primitives.jsx';
 import { NAV_FLAT, Sidebar, Topbar } from './layout.jsx';
 import { Dashboard, GitHubConnect } from './views-dashboard.jsx';
+import { AuthView } from './views-auth.jsx';
 import { RepoDetail, ReposList } from './views-repos.jsx';
 import { PipelineDetail, PipelinesList, RunDetail } from './views-pipeline.jsx';
 import { CreatePipeline } from './views-pipeline-create.jsx';
@@ -65,6 +67,17 @@ function providerToAccount(sp) {
   };
 }
 
+const USER_STORAGE_KEY = "cicd_user";
+function loadCachedUser() {
+  try { const raw = localStorage.getItem(USER_STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
+}
+function saveCachedUser(user) {
+  try {
+    if (user) localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
+    else localStorage.removeItem(USER_STORAGE_KEY);
+  } catch {}
+}
+
 function fmtRelTime(iso) {
   if (!iso) return "—";
   const diff = (Date.now() - new Date(iso).getTime()) / 1000;
@@ -83,12 +96,18 @@ function mapApiRepo(r) {
     owner:         r.owner,
     repoUrl:       r.repo_url,
     defaultBranch: r.default_branch,
+    syncBranch:    r.sync_branch || null,
     provider:      r.provider,
+    // webhook_registered chỉ có trong response map repo (POST .../repositories) — các GET khác
+    // không trả field này. undefined = "không rõ" (đã biết trước đó nhưng response này không nói tới),
+    // giữ nguyên qua updateRepo() thay vì bị ghi đè về false gây hiểu lầm.
+    webhookRegistered: Object.prototype.hasOwnProperty.call(r, "webhook_registered") ? r.webhook_registered : undefined,
     language:      null,
     private:       false,
     pipelineCount: 0,
     status:        "active",
-    lastSync:      fmtRelTime(r.last_synced_at),
+    // last_synced_at luôn null ở backend hiện tại (chưa implement) — dùng created_at (thời điểm map) để hiển thị.
+    lastSync:      fmtRelTime(r.created_at),
   };
 }
 
@@ -107,26 +126,25 @@ function routeToPath(r) {
     case 'webhooks':        return '/webhooks';
     case 'build-history':   return '/build-history';
     case 'pat':             return '/pat';
+    case 'login':           return '/login';
     default:                return '/';
   }
 }
 
 /* Route wrapper components — read URL params, pass as props to views */
-function RepoDetailRoute({ repos, onNav, toast, onDeleteRepo, onSync }) {
+function RepoDetailRoute({ repos, onNav, toast, onDeleteRepo, onRepoUpdated }) {
   const { repoId } = useParams();
-  return <RepoDetail repoId={repoId} repos={repos} onNav={onNav} toast={toast} onDeleteRepo={onDeleteRepo} onSync={onSync} />;
+  return <RepoDetail repoId={repoId} repos={repos} onNav={onNav} toast={toast} onDeleteRepo={onDeleteRepo} onRepoUpdated={onRepoUpdated} />;
 }
 
-function PipelineDetailRoute({ repos, onNav, onTriggerBuild, toast }) {
+function PipelineDetailRoute({ repos, onNav, toast }) {
   const { pipelineId } = useParams();
-  return <PipelineDetail pipelineId={pipelineId} repos={repos} onNav={onNav} onTriggerBuild={onTriggerBuild} toast={toast} />;
+  return <PipelineDetail pipelineId={pipelineId} repos={repos} onNav={onNav} toast={toast} />;
 }
 
-function RunDetailRoute({ repos, onNav, onRunComplete, toast }) {
+function RunDetailRoute({ repos, onNav, toast }) {
   const { pipelineId, runId } = useParams();
-  const [searchParams] = useSearchParams();
-  const live = searchParams.get('live') === '1';
-  return <RunDetail key={runId + (live ? '_live' : '')} pipelineId={pipelineId} runId={runId} live={live} repos={repos} onNav={onNav} onRunComplete={onRunComplete} toast={toast} />;
+  return <RunDetail key={pipelineId + ":" + runId} pipelineId={pipelineId} runId={runId} repos={repos} onNav={onNav} toast={toast} />;
 }
 
 function JenkinsPipelineRoute({ account, repos, onNav, toast }) {
@@ -141,7 +159,6 @@ function CommandPalette({ open, onClose, repos, onNav }) {
   const cmds = [
     ...NAV_FLAT.map((n) => ({ type: "Trang", label: n.label, icon: n.icon, to: { view: n.id } })),
     ...repos.map((r) => ({ type: "Repository", label: r.name, icon: "repo", to: { view: "repo", repoId: r.id } })),
-    ...PIPELINES.map((p) => ({ type: "Pipeline", label: `${p.title} · ${p.name}`, icon: "pipeline", to: { view: "pipeline", pipelineId: p.id } })),
   ].filter((c) => c.label.toLowerCase().includes(q.toLowerCase()));
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 150, background: "var(--overlay)", backdropFilter: "blur(4px)", display: "flex", justifyContent: "center", paddingTop: "14vh", animation: "fade-in .14s ease" }}>
@@ -175,15 +192,42 @@ function AppInner() {
   const location = useLocation();
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [account, setAccount] = useState({ connected: false });
+  const [user, setUserRaw] = useState(() => (getAuthToken() ? loadCachedUser() : null));
   const [repos, setRepos] = useState([]);
   const [toast, setToastState] = useState(null);
   const [addRepoOpen, setAddRepoOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(false);
-  const [, force] = useState(0);
   const toastTimer = useRef(null);
 
+  // Bọc setState để luôn đồng bộ cache localStorage — khôi phục ngay lúc mount (initial state ở trên)
+  // thay vì đợi round-trip /auth/me.
+  function setUser(u) {
+    setUserRaw(u);
+    saveCachedUser(u);
+  }
+
   useEffect(() => { applyTheme(t); }, [t]);
+
+  // Chỉ gọi /auth/me khi có token nhưng KHÔNG có cache (vd cache bị xoá thủ công) — để xác thực token
+  // còn sống. KHÔNG dùng response này để ghi đè danh tính đã cache: khi backend chạy AUTH_ENABLED=false
+  // (mặc định hiện tại), /auth/me luôn trả về user dev cố định bất kể token gửi lên là gì — tin response
+  // đó sẽ xoá mất danh tính thật vừa đăng nhập.
+  useEffect(() => {
+    if (getAuthToken() && !loadCachedUser()) {
+      apiMe().then(setUser).catch(() => {});
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // JWT hết hạn/không hợp lệ ở bất kỳ request nào → client.js đã tự xoá token, ở đây chỉ cần
+  // đồng bộ lại UI + báo cho người dùng.
+  useEffect(() => {
+    onUnauthorized(() => {
+      setUser(null);
+      showToast("Phiên đăng nhập hết hạn — vui lòng đăng nhập lại", "error");
+      navigate('/login');
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     listSourceProviders()
@@ -232,6 +276,17 @@ function AppInner() {
     if (providerData?.id) setAccount(providerToAccount(providerData));
   }
 
+  function handleLoggedIn(data) {
+    setAuthToken(data.access_token);
+    setUser(data.user);
+  }
+
+  function logout() {
+    setAuthToken(null);
+    setUser(null);
+    showToast("Đã đăng xuất", "info");
+  }
+
   async function disconnect() {
     if (account.id) {
       try { await deleteSourceProvider(account.id); } catch {}
@@ -241,19 +296,19 @@ function AppInner() {
     navigate('/github');
   }
 
-  async function syncRepos() {
-    if (!account.id) return;
-    try {
-      const data = await syncSourceProvider(account.id);
-      showToast(`Đã đồng bộ ${(data ?? []).length} repository từ GitHub`, "success");
-    } catch (err) {
-      showToast(err.message || "Đồng bộ thất bại", "error");
-    }
+  function addRepo(apiRepo) {
+    const mapped = mapApiRepo(apiRepo);
+    setRepos((rs) => rs.some((r) => r.id === apiRepo.id) ? rs : [...rs, mapped]);
   }
 
-  function addRepo(apiRepo, branch) {
-    const mapped = { ...mapApiRepo(apiRepo), mappedBranch: branch };
-    setRepos((rs) => rs.some((r) => r.id === apiRepo.id) ? rs : [...rs, mapped]);
+  function updateRepo(apiRepo) {
+    const mapped = mapApiRepo(apiRepo);
+    setRepos((rs) => rs.map((r) => {
+      if (r.id !== mapped.id) return r;
+      // webhookRegistered chỉ có ở response map — response PATCH (đổi nhánh) không có field này,
+      // đừng để nó ghi đè giá trị đã biết trước đó về "không rõ".
+      return { ...r, ...mapped, webhookRegistered: mapped.webhookRegistered !== undefined ? mapped.webhookRegistered : r.webhookRegistered };
+    }));
   }
 
   async function deleteRepo(repoId) {
@@ -267,44 +322,6 @@ function AppInner() {
     }
   }
 
-  function createPipeline(cfg) {
-    PIPELINES.unshift({
-      id: "pl_" + Date.now(), repoId: cfg.repoId, name: cfg.name, path: cfg.path, title: cfg.title,
-      preset: cfg.preset, stages: cfg.stages, status: "queued", triggers: cfg.triggers,
-      branchFilter: cfg.branchFilter, lastRun: "chưa chạy", successRate: 0, avgDuration: 0,
-      env: cfg.env, jobs: cfg.jobs, runs: [],
-    });
-    setRepos((rs) => rs.map((r) => r.id === cfg.repoId ? { ...r, pipelineCount: (r.pipelineCount || 0) + 1, lastSync: "vừa xong" } : r));
-    force((n) => n + 1);
-  }
-
-  function triggerBuild(pid) {
-    const p = PIPELINES.find((x) => x.id === pid);
-    const num = Math.max(0, ...p.runs.map((r) => typeof r.number === "number" ? r.number : 0)) + 1;
-    const stageNames = p.stages || STAGE_PRESETS[p.preset];
-    const run = {
-      id: "run_live_" + Date.now(), number: num, status: "running", branch: "main",
-      commit: Math.random().toString(16).slice(2, 9), message: "Build thủ công · trigger từ giao diện",
-      author: account.username || "you", avatar: account.avatar || "ME", trigger: "manual",
-      startedAt: "vừa xong", duration: null,
-      stages: stageNames.map((n) => ({ name: n, status: "queued", duration: 0 })),
-    };
-    p.runs = [run, ...p.runs];
-    p.status = "running";
-    showToast(`Đã chạy pipeline #${num} · ${p.name}`, "info");
-    return run.id;
-  }
-
-  function runComplete(pid, runId, status) {
-    const p = PIPELINES.find((x) => x.id === pid);
-    if (!p) return;
-    const run = p.runs.find((r) => r.id === runId);
-    if (run) { run.status = status; run.duration = 60 + Math.floor(Math.random() * 120); }
-    p.status = status;
-    force((n) => n + 1);
-    showToast(`Build #${run?.number} ${status === "success" ? "thành công" : "thất bại"}`, status === "success" ? "success" : "error");
-  }
-
   const shared = { onNav: nav, toast: showToast };
 
   return (
@@ -313,16 +330,18 @@ function AppInner() {
       <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
         <Topbar onSearch={() => setPaletteOpen(true)} theme={t.theme}
           navCollapsed={navCollapsed} onToggleNav={() => setNavCollapsed((c) => !c)}
-          onToggleTheme={() => setTweak("theme", t.theme === "dark" ? "light" : "dark")} />
+          onToggleTheme={() => setTweak("theme", t.theme === "dark" ? "light" : "dark")}
+          user={user} onLogin={() => navigate('/login')} onLogout={logout} />
         <Routes>
           <Route path="/"                                       element={<Dashboard repos={repos} account={account} {...shared} />} />
+          <Route path="/login"                                  element={<AuthView onLoggedIn={handleLoggedIn} {...shared} />} />
           <Route path="/github"                                 element={<GitHubConnect account={account} onConnect={connect} onDisconnect={disconnect} {...shared} />} />
-          <Route path="/repos"                                  element={<ReposList repos={repos} account={account} addRepoOpen={addRepoOpen} setAddRepoOpen={setAddRepoOpen} onAddRepo={addRepo} onSync={syncRepos} {...shared} />} />
-          <Route path="/repos/:repoId"                          element={<RepoDetailRoute repos={repos} onDeleteRepo={deleteRepo} onSync={syncRepos} {...shared} />} />
-          <Route path="/pipelines"                              element={<PipelinesList repos={repos} account={account} onTriggerBuild={triggerBuild} {...shared} />} />
-          <Route path="/pipelines/new"                          element={<CreatePipeline repos={repos} account={account} onCreate={createPipeline} {...shared} />} />
-          <Route path="/pipelines/:pipelineId"                  element={<PipelineDetailRoute repos={repos} onTriggerBuild={triggerBuild} {...shared} />} />
-          <Route path="/pipelines/:pipelineId/runs/:runId"      element={<RunDetailRoute repos={repos} onRunComplete={runComplete} {...shared} />} />
+          <Route path="/repos"                                  element={<ReposList repos={repos} account={account} addRepoOpen={addRepoOpen} setAddRepoOpen={setAddRepoOpen} onAddRepo={addRepo} {...shared} />} />
+          <Route path="/repos/:repoId"                          element={<RepoDetailRoute repos={repos} onDeleteRepo={deleteRepo} onRepoUpdated={updateRepo} {...shared} />} />
+          <Route path="/pipelines"                              element={<PipelinesList repos={repos} account={account} {...shared} />} />
+          <Route path="/pipelines/new"                          element={<CreatePipeline repos={repos} account={account} {...shared} />} />
+          <Route path="/pipelines/:pipelineId"                  element={<PipelineDetailRoute repos={repos} {...shared} />} />
+          <Route path="/pipelines/:pipelineId/runs/:runId"      element={<RunDetailRoute repos={repos} {...shared} />} />
           <Route path="/pipelines/:pipelineId/jenkins"          element={<JenkinsPipelineRoute account={account} repos={repos} {...shared} />} />
           <Route path="/jenkins"                                element={<JenkinsView account={account} repos={repos} {...shared} />} />
           <Route path="/webhooks"                               element={<WebhooksView account={account} {...shared} />} />

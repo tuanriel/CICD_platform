@@ -6,7 +6,7 @@ import { Select } from './views-build.jsx';
 import { syncRepository } from './api/repositories.js';
 
 /* ============================================================
-   Views — Đồng bộ pipeline từ .workflow/
+   Views — Đồng bộ pipeline từ .viettelcloud/workflows/
    POST /repositories/:id/sync → parse *.yaml → Pipeline[]
    ============================================================ */
 
@@ -59,14 +59,13 @@ function CreatePipeline({ repos, account, onNav, toast }) {
       const data = await syncRepository(repo.id);
       setPipelines(data ?? []);
       setScanned(true);
-      const ok  = (data ?? []).filter((p) => p.status === "active").length;
-      const err = (data ?? []).filter((p) => p.status === "error").length;
-      if (data?.length === 0) {
-        toast("Không tìm thấy file .workflow/*.yaml nào", "info");
-      } else if (err > 0) {
-        toast(`Quét xong · ${ok} pipeline OK · ${err} lỗi parse`, "error");
+      // Sync KHÔNG parse YAML — pipeline luôn về "pending" ngay sau sync (kể cả từng active/error
+      // trước đó), nên chỉ có thể báo tổng số file tìm thấy ở bước này.
+      const total = (data ?? []).length;
+      if (total === 0) {
+        toast("Không tìm thấy file .viettelcloud/workflows/*.yaml nào", "info");
       } else {
-        toast(`Phát hiện ${ok} pipeline`, "success");
+        toast(`Đã đồng bộ ${total} pipeline`, "success");
       }
     } catch (e) {
       const msgs = {
@@ -79,14 +78,11 @@ function CreatePipeline({ repos, account, onNav, toast }) {
     }
   }
 
-  const plOk  = pipelines.filter((p) => p.status === "active").length;
-  const plErr = pipelines.filter((p) => p.status === "error").length;
-
   return (
     <Page>
       <PageHeader title="Đồng bộ pipeline" icon="pipeline"
         breadcrumb={[{ label: "Pipeline", to: { view: "pipelines" } }, { label: "Đồng bộ pipeline" }]} onNav={onNav}
-        subtitle="Quét thư mục .workflow/ trong repository, parse file YAML và đồng bộ pipeline vào platform." />
+        subtitle="Quét thư mục .viettelcloud/workflows/ trong repository, parse file YAML và đồng bộ pipeline vào platform." />
 
       {/* Step 1 — chọn repo */}
       <Card style={{ marginBottom: 16 }}>
@@ -121,7 +117,7 @@ function CreatePipeline({ repos, account, onNav, toast }) {
             <Icon name="info" size={13} />
             Platform sẽ gọi <span className="mono" style={{ margin: "0 4px", color: "var(--text-2)" }}>
               POST /repositories/{repo.id.slice(0, 8)}…/sync
-            </span> để quét và parse file trong <span className="mono" style={{ margin: "0 4px" }}>.workflow/</span>.
+            </span> để quét và parse file trong <span className="mono" style={{ margin: "0 4px" }}>.viettelcloud/workflows/</span>.
           </div>
         )}
       </Card>
@@ -130,7 +126,7 @@ function CreatePipeline({ repos, account, onNav, toast }) {
       {(scanning || scanned) && (
         <Card style={{ marginBottom: 16 }}>
           <StepHead n="2" title="Pipeline phát hiện được"
-            desc={repo ? `Quét .workflow/*.yaml trong ${repo.fullName}` : ""}
+            desc={repo ? `Quét .viettelcloud/workflows/*.yaml trong ${repo.fullName}` : ""}
             done={scanned && pipelines.length > 0}
             active={scanning || (scanned && pipelines.length === 0)} />
           <div style={{ paddingLeft: 38 }}>
@@ -148,25 +144,29 @@ function CreatePipeline({ repos, account, onNav, toast }) {
                 color: "var(--text-3)", fontSize: 13.5 }}>
                 <Icon name="info" size={16} />
                 Không tìm thấy file nào trong{" "}
-                <span className="mono" style={{ margin: "0 4px" }}>.workflow/</span>.
+                <span className="mono" style={{ margin: "0 4px" }}>.viettelcloud/workflows/</span>.
                 Thêm file <span className="mono" style={{ margin: "0 4px" }}>*.yaml</span>
                 vào thư mục đó để platform nhận diện pipeline.
               </div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
                 {pipelines.map((p) => {
-                  const isErr = p.status === "error";
+                  // Ngay sau sync, mọi pipeline đều "pending" (chưa parse) — active/error chỉ xuất
+                  // hiện nếu danh sách này được load lại sau khi ai đó đã trigger pipeline.
+                  const cfg = {
+                    error:  { icon: "xCircle",     color: "var(--red)",   iconBg: "color-mix(in oklab, var(--red) 15%, transparent)",  border: "color-mix(in oklab, var(--red) 30%, transparent)",  cardBg: "var(--red-dim)", text: "Lỗi cú pháp YAML — không thể build", tag: <Tag mono color="var(--red)" bg="color-mix(in oklab,var(--red) 18%,transparent)" icon="xCircle">error</Tag> },
+                    active: { icon: "checkCircle", color: "var(--green)", iconBg: "var(--green-dim)",                                    border: "var(--border)",                                      cardBg: "var(--panel-2)", text: "YAML hợp lệ", tag: <Tag mono color="var(--green)" bg="var(--green-dim)" icon="check">active</Tag> },
+                  }[p.status] ?? { icon: "doc", color: "var(--text-3)", iconBg: "var(--panel-3)", border: "var(--border)", cardBg: "var(--panel-2)", text: "Đã đồng bộ", tag: <Tag mono color="var(--text-3)" bg="var(--panel-3)" icon="doc">đã đồng bộ</Tag> };
                   return (
                     <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 13,
                       padding: "12px 14px",
-                      border: `1px solid ${isErr ? "color-mix(in oklab, var(--red) 30%, transparent)" : "var(--border)"}`,
+                      border: `1px solid ${cfg.border}`,
                       borderRadius: "var(--r-md)",
-                      background: isErr ? "var(--red-dim)" : "var(--panel-2)" }}>
+                      background: cfg.cardBg }}>
                       <div style={{ width: 34, height: 34, borderRadius: 8, flexShrink: 0,
-                        background: isErr ? "color-mix(in oklab, var(--red) 15%, transparent)" : "var(--panel-3)",
+                        background: cfg.iconBg,
                         display: "grid", placeItems: "center" }}>
-                        <Icon name={isErr ? "xCircle" : "pipeline"} size={17}
-                          style={{ color: isErr ? "var(--red)" : "var(--accent)" }} />
+                        <Icon name={cfg.icon} size={17} style={{ color: cfg.color }} />
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -175,19 +175,11 @@ function CreatePipeline({ repos, account, onNav, toast }) {
                             {p.file_path}
                           </span>
                         </div>
-                        <div style={{ fontSize: 12, marginTop: 3,
-                          color: isErr ? "var(--red)" : "var(--text-3)" }}>
-                          {isErr
-                            ? "Lỗi cú pháp YAML — pipeline ở trạng thái error, không thể trigger"
-                            : "Parse thành công · sẵn sàng trigger thủ công"}
+                        <div style={{ fontSize: 12, marginTop: 3, color: cfg.color }}>
+                          {cfg.text}
                         </div>
                       </div>
-                      <div style={{ flexShrink: 0 }}>
-                        {isErr
-                          ? <Tag mono color="var(--red)"
-                              bg="color-mix(in oklab,var(--red) 18%,transparent)">error</Tag>
-                          : <Tag mono color="var(--green)" bg="var(--green-dim)" icon="check">active</Tag>}
-                      </div>
+                      <div style={{ flexShrink: 0 }}>{cfg.tag}</div>
                     </div>
                   );
                 })}
@@ -201,22 +193,12 @@ function CreatePipeline({ repos, account, onNav, toast }) {
       {scanned && pipelines.length > 0 && (
         <Card style={{ marginBottom: 16 }}>
           <StepHead n="3" title="Hoàn tất"
-            desc="Pipeline đã được tạo và lưu vào platform."
+            desc="Pipeline đã được tạo (raw YAML) và lưu vào platform."
             done active={false} />
           <div style={{ paddingLeft: 38 }}>
-            <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 18 }}>
-              {plOk > 0 && (
-                <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13.5 }}>
-                  <Icon name="checkCircle" size={16} style={{ color: "var(--green)" }} strokeWidth={2} />
-                  {plOk} pipeline sẵn sàng
-                </div>
-              )}
-              {plErr > 0 && (
-                <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13.5, color: "var(--red)" }}>
-                  <Icon name="xCircle" size={16} strokeWidth={2} />
-                  {plErr} file YAML lỗi — kiểm tra cú pháp rồi đồng bộ lại
-                </div>
-              )}
+            <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13.5, marginBottom: 18, color: "var(--text-2)" }}>
+              <Icon name="doc" size={16} strokeWidth={2} />
+              {pipelines.length} pipeline đã đồng bộ — vào trang repository hoặc trang Pipeline và bấm Build để chạy
             </div>
             <div style={{ display: "flex", gap: 9, flexWrap: "wrap" }}>
               <Button variant="secondary" icon="repo"

@@ -185,7 +185,7 @@ function PatManagement({ account, onNav, onConnect, toast }) {
         {[
           ["shield", "Kiến trúc độc lập", "Không khoá cứng vào một nhà cung cấp — tránh Vendor Lock-in, dễ mở rộng sang GitLab, Bitbucket."],
           ["lock",   "Bảo mật",           "Token được mã hoá AES-256-GCM khi lưu, không bao giờ lưu plaintext."],
-          ["sync",   "Đồng bộ tự động",   "Sau khi liên kết, pipeline trong .workflow được nhận diện và đồng bộ tự động."],
+          ["sync",   "Đồng bộ tự động",   "Sau khi liên kết, pipeline trong .viettelcloud/workflows được nhận diện và đồng bộ tự động."],
         ].map(([icon, title, desc]) => (
           <Card key={title} pad={16}>
             <Icon name={icon} size={18} style={{ color: "var(--accent)", marginBottom: 10 }} />

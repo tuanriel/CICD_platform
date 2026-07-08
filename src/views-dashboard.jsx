@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { PIPELINES, WEBHOOK_EVENTS } from './data.jsx';
-import { Avatar, Button, Card, Icon, Input, STATUS_META, SectionLabel, StatusBadge, StatusDot, Tag } from './primitives.jsx';
+import React, { useState, useEffect } from 'react';
+import { WEBHOOK_EVENTS } from './data.jsx';
+import { Avatar, Button, Card, Icon, Input, SectionLabel, StatusBadge, StatusDot, Tag } from './primitives.jsx';
 import { Page, PageHeader } from './layout.jsx';
-import { allPipelineRuns } from './views-build-history.jsx';
+import { fetchAllPipelines, fetchBuildsForPipelines, mapBuildStatus, fmtTime } from './views-pipeline.jsx';
 import { createSourceProvider } from './api/source-providers.js';
 
 const API_ERROR_MESSAGES = {
@@ -33,26 +33,24 @@ function StatCard({ label, value, sub, icon, accent, delay = 0 }) {
   );
 }
 
-function MiniBars({ runs }) {
-  return (
-    <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 30 }}>
-      {runs.map((r, i) => {
-        const m = STATUS_META[r.status] || STATUS_META.queued;
-        const h = r.status === "queued" ? 8 : 12 + ((r.duration || 60) % 18);
-        return <span key={i} title={`#${r.number} · ${m.label}`} style={{ width: 5, height: h, borderRadius: 2, background: m.color, opacity: r.status === "success" ? 0.55 : 1, animation: `barfill .5s ease ${i * 0.04}s both` }} />;
-      })}
-    </div>
-  );
-}
-
 function Dashboard({ repos, account, onNav }) {
-  const runs = useMemo(() => allPipelineRuns(repos), [repos, account]);
-  const recent = runs.slice(0, 7);
-  const running = runs.filter((b) => b.status === "running").length;
-  const success = runs.filter((b) => b.status === "success").length;
-  const failed = runs.filter((b) => b.status === "failed").length;
-  const rate = success + failed ? Math.round((success / (success + failed)) * 100) : 100;
-  const pipelines = PIPELINES.map((p) => ({ ...p, repo: repos.find((r) => r.id === p.repoId) })).filter((p) => p.repo);
+  const [pipelines, setPipelines] = useState([]);
+  const [builds, setBuilds] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [jenkinsDown, setJenkinsDown] = useState(false);
+
+  useEffect(() => {
+    if (!account.connected || repos.length === 0) { setPipelines([]); setBuilds([]); setLoading(false); return; }
+    let cancelled = false;
+    setLoading(true);
+    fetchAllPipelines(repos).then(async (pls) => {
+      if (cancelled) return;
+      setPipelines(pls);
+      const { builds, jenkinsDown } = await fetchBuildsForPipelines(pls);
+      if (!cancelled) { setBuilds(builds); setJenkinsDown(jenkinsDown); }
+    }).finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [repos, account.connected]);
 
   if (!account.connected) {
     return (
@@ -63,6 +61,16 @@ function Dashboard({ repos, account, onNav }) {
     );
   }
 
+  const recent = builds.slice(0, 7);
+  const running = builds.filter((b) => b.status === "running" || b.status === "queued").length;
+  const success = builds.filter((b) => b.status === "success").length;
+  const failed = builds.filter((b) => b.status === "failure" || b.status === "error").length;
+  const rate = success + failed ? Math.round((success / (success + failed)) * 100) : 100;
+
+  // build gần nhất theo từng pipeline (builds đã sắp mới nhất trước)
+  const latestByPipeline = {};
+  for (const b of builds) { if (!latestByPipeline[b.pipeline.id]) latestByPipeline[b.pipeline.id] = b; }
+
   return (
     <Page wide>
       <PageHeader title="Tổng quan" icon="dashboard"
@@ -70,10 +78,10 @@ function Dashboard({ repos, account, onNav }) {
         actions={<><Button variant="secondary" icon="clock" onClick={() => onNav({ view: "build-history" })}>Lịch sử build</Button><Button variant="primary" icon="plus" onClick={() => onNav({ view: "create-pipeline" })}>Tạo pipeline</Button></>} />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14, marginBottom: 16 }}>
-        <StatCard label="Pipeline" value={pipelines.length} sub={`${repos.length} repository được ánh xạ`} icon="pipeline" />
-        <StatCard label="Đang chạy" value={running} sub={running ? "Pipeline đang thực thi" : "Không có lần chạy nào"} icon="activity" accent />
-        <StatCard label="Tỉ lệ thành công" value={rate + "%"} sub="Toàn bộ lần chạy gần đây" icon="checkCircle" />
-        <StatCard label="Thất bại" value={failed} sub="Cần chú ý" icon="xCircle" />
+        <StatCard label="Pipeline" value={loading ? "…" : pipelines.length} sub={`${repos.length} repository được ánh xạ`} icon="pipeline" />
+        <StatCard label="Đang chạy" value={loading ? "…" : jenkinsDown ? "—" : running} sub={jenkinsDown ? "Jenkins không phản hồi" : running ? "Pipeline đang thực thi" : "Không có lần chạy nào"} icon="activity" accent />
+        <StatCard label="Tỉ lệ thành công" value={loading ? "…" : jenkinsDown ? "—" : rate + "%"} sub="Toàn bộ lần chạy gần đây" icon="checkCircle" />
+        <StatCard label="Thất bại" value={loading ? "…" : jenkinsDown ? "—" : failed} sub="Cần chú ý" icon="xCircle" />
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1.55fr 1fr", gap: 16, alignItems: "start" }}>
@@ -84,27 +92,39 @@ function Dashboard({ repos, account, onNav }) {
             <button onClick={() => onNav({ view: "build-history" })} style={{ fontSize: 12.5, color: "var(--accent)", display: "flex", alignItems: "center", gap: 4, fontWeight: 540 }}>Tất cả <Icon name="arrowRight" size={13} /></button>
           </div>
           <div>
-            {recent.map((b, i) => (
-              <div key={b.pipeline.id + b.id} onClick={() => onNav({ view: "run", pipelineId: b.pipeline.id, runId: b.id })}
-                style={{ display: "flex", alignItems: "center", gap: 13, padding: "12px 18px", cursor: "pointer",
-                  borderBottom: i < recent.length - 1 ? "1px solid var(--border)" : "none", transition: "background .12s" }}
-                onMouseEnter={(e) => e.currentTarget.style.background = "var(--panel-2)"}
-                onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
-                <StatusDot status={b.status} size={9} />
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ fontSize: 13.5, fontWeight: 540, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.message}</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 3, fontSize: 12, color: "var(--text-3)" }}>
-                    <span className="mono">{b.pipeline.title}</span>
-                    <span style={{ display: "inline-flex", alignItems: "center", gap: 3 }}><Icon name="branch" size={11} />{b.branch}</span>
-                    <span className="mono">{typeof b.commit === "string" ? b.commit.slice(0, 7) : b.commit}</span>
+            {loading ? (
+              <div style={{ padding: 30, textAlign: "center", color: "var(--text-3)", fontSize: 13 }}>
+                <Icon name="sync" size={18} style={{ animation: "spin .7s linear infinite", margin: "0 auto 8px", display: "block" }} />Đang tải…
+              </div>
+            ) : jenkinsDown ? (
+              <div style={{ padding: 30, textAlign: "center", color: "var(--amber)", fontSize: 13, display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+                <Icon name="jenkins" size={20} />Không kết nối được Jenkins
+              </div>
+            ) : recent.length === 0 ? (
+              <div style={{ padding: 30, textAlign: "center", color: "var(--text-3)", fontSize: 13 }}>Chưa có lần build nào.</div>
+            ) : recent.map((b) => {
+              const st = mapBuildStatus(b.status);
+              const isLive = b.status === "running" || b.status === "queued";
+              return (
+                <div key={b.pipeline.id + ":" + b.number} onClick={() => onNav({ view: "run", pipelineId: b.pipeline.id, runId: b.number })}
+                  style={{ display: "flex", alignItems: "center", gap: 13, padding: "12px 18px", cursor: "pointer",
+                    borderBottom: "1px solid var(--border)", transition: "background .12s" }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = "var(--panel-2)"}
+                  onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+                  <StatusDot status={st} size={9} />
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 540, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.pipeline.name}</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 3, fontSize: 12, color: "var(--text-3)" }}>
+                      <span className="mono">{b.repo.name}</span>
+                    </div>
+                  </div>
+                  <div style={{ textAlign: "right", flexShrink: 0 }}>
+                    <div style={{ fontSize: 12, color: "var(--text-2)", fontWeight: 500 }}>#{b.number}</div>
+                    <div style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 2 }}>{isLive ? "đang chạy" : fmtTime(b.started_at)}</div>
                   </div>
                 </div>
-                <div style={{ textAlign: "right", flexShrink: 0 }}>
-                  <div style={{ fontSize: 12, color: "var(--text-2)", fontWeight: 500 }}>#{b.number}</div>
-                  <div style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 2 }}>{b.status === "running" ? "đang chạy" : b.startedAt}</div>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
 
@@ -116,19 +136,26 @@ function Dashboard({ repos, account, onNav }) {
               <button onClick={() => onNav({ view: "pipelines" })} style={{ fontSize: 12.5, color: "var(--accent)", fontWeight: 540 }}>Quản lý</button>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              {pipelines.slice(0, 5).map((p) => (
-                <div key={p.id} onClick={() => onNav({ view: "pipeline", pipelineId: p.id })}
-                  style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 8px", margin: "0 -8px", borderRadius: "var(--r-sm)", cursor: "pointer", transition: "background .12s" }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "var(--panel-2)"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
-                  <Icon name="pipeline" size={15} style={{ color: "var(--text-3)" }} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 540, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.title}</div>
-                    <div className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>{p.repo.name}</div>
+              {loading ? (
+                <div style={{ padding: "10px 8px", color: "var(--text-3)", fontSize: 13 }}>Đang tải…</div>
+              ) : pipelines.length === 0 ? (
+                <div style={{ padding: "10px 8px", color: "var(--text-3)", fontSize: 13 }}>Chưa có pipeline nào.</div>
+              ) : pipelines.slice(0, 5).map((p) => {
+                const lastBuild = latestByPipeline[p.id];
+                return (
+                  <div key={p.id} onClick={() => onNav({ view: "pipeline", pipelineId: p.id })}
+                    style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 8px", margin: "0 -8px", borderRadius: "var(--r-sm)", cursor: "pointer", transition: "background .12s" }}
+                    onMouseEnter={(e) => e.currentTarget.style.background = "var(--panel-2)"}
+                    onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+                    <Icon name="pipeline" size={15} style={{ color: "var(--text-3)" }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 540, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
+                      <div className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>{p.repo.name}</div>
+                    </div>
+                    {lastBuild ? <StatusDot status={mapBuildStatus(lastBuild.status)} size={8} /> : <span style={{ fontSize: 11, color: "var(--text-3)" }}>—</span>}
                   </div>
-                  {p.runs[0] ? <StatusDot status={p.status} size={8} /> : <span style={{ fontSize: 11, color: "var(--text-3)" }}>—</span>}
-                </div>
-              ))}
+                );
+              })}
             </div>
           </Card>
 
@@ -171,7 +198,7 @@ function EmptyConnectState({ onNav }) {
         </div>
         <h2 style={{ fontSize: 20, fontWeight: 640, letterSpacing: "-.02em", marginBottom: 8 }}>Bắt đầu với CICD Platform</h2>
         <p style={{ fontSize: 14, color: "var(--text-2)", maxWidth: 440, margin: "0 auto 24px", lineHeight: 1.55 }}>
-          Kết nối tài khoản GitHub qua Personal Access Token để đồng bộ Pipeline từ thư mục <span className="mono" style={{ color: "var(--text)" }}>.workflow</span> và bắt đầu tự động hóa.
+          Kết nối tài khoản GitHub qua Personal Access Token để đồng bộ Pipeline từ thư mục <span className="mono" style={{ color: "var(--text)" }}>.viettelcloud/workflows</span> và bắt đầu tự động hóa.
         </p>
         <Button variant="primary" size="lg" icon="link" onClick={() => onNav({ view: "github" })}>Kết nối GitHub</Button>
       </div>
